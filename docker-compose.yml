@@ -1,24 +1,28 @@
-version: '3.8'
+
 
 services:
   # PostgreSQL MCP Read-Only Server
   mcp-postgres:
-    image: mcp/postgres-readonly:latest
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
     container_name: md-mcp-postgres
+    working_dir: /app
     environment:
-      - POSTGRES_CONNECTION_STRING=${DATABASE_URL}
-      - MCP_SERVER_PORT=3000
+      - DATABASE_URL=${DATABASE_URL}
     ports:
       - "3000:3000"
     networks:
       - msme-network
+    volumes:
+      - ./mcp-server:/app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 30s
 
   # Backend API Server
   backend:
@@ -33,8 +37,8 @@ services:
       - DATABASE_URL=${DATABASE_URL}
       - MCP_SERVER_URL=http://mcp-postgres:3000
       - OPENROUTER_MODEL=${OPENROUTER_MODEL}
-      - LOG_LEVEL=${LOG_LEVEL}
-      - ENVIRONMENT=${ENVIRONMENT}
+      - LOG_LEVEL=info
+      - ENVIRONMENT=testing
     depends_on:
       mcp-postgres:
         condition: service_healthy
