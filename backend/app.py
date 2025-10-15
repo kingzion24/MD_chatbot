@@ -1,10 +1,9 @@
-# backend/app.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import os
 from datetime import datetime
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 from typing import Dict
 import logging
 
@@ -27,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI
 app = FastAPI(
-    title="MSME Business Assistant API",
+    title="Mali Daftari Business Assistant API",
     version="1.0.0",
     description="AI-powered business assistant for MSME owners"
 )
@@ -44,44 +43,45 @@ app.add_middleware(
 # Validate config on startup
 try:
     Config.validate()
-    logger.info("Configuration validated successfully")
+    logger.info("✅ Configuration validated successfully")
 except ValueError as e:
-    logger.error(f"Configuration error: {str(e)}")
+    logger.error(f"❌ Configuration error: {str(e)}")
     raise
 
 # Initialize clients
 config = Config()
-openrouter_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=config.OPENROUTER_API_KEY,
-)
-mcp_client = MCPClient(config.MCP_SERVER_URL)
 
-# MCP Tools Definition
+# Initialize Anthropic Claude
+anthropic_client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
+logger.info(f"✅ Using Anthropic Claude: {config.ANTHROPIC_MODEL}")
+
+# Initialize MCP Client
+mcp_client = MCPClient(config.MCP_SERVER_URL)
+logger.info(f"✅ MCP Server configured: {config.MCP_SERVER_URL}")
+
+# MCP Tools Definition (Anthropic format)
 MCP_TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "query_business_data",
-        "description": """Query business data from PostgreSQL database. 
-        Available tables: inventories, products, sales, expenses.
-        Use this tool ONLY when the user asks about their specific business data.
-        Do NOT use this for general business advice questions.""",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "SQL SELECT query to execute (read-only). Always use proper JOINs."
-                },
-                "explanation": {
-                    "type": "string",
-                    "description": "Brief explanation of what this query does"
-                }
+    "name": "query_business_data",
+    "description": """Query business data from PostgreSQL database. 
+    Available tables: inventories, products, sales, expenses.
+    Use this tool ONLY when the user asks about their specific business data.
+    Do NOT use this for general business advice questions.""",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "SQL SELECT query to execute (read-only). Always use proper JOINs."
             },
-            "required": ["query"]
-        }
+            "explanation": {
+                "type": "string",
+                "description": "Brief explanation of what this query does"
+            }
+        },
+        "required": ["query"]
     }
 }]
+
 
 async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
     """Execute SQL query via MCP server with security"""
@@ -89,17 +89,17 @@ async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
         # Validate and secure SQL
         secured_query = validate_and_secure_sql(sql_query, business_id)
         if not secured_query:
-            logger.warning(f"Invalid SQL query rejected: {sql_query}")
+            logger.warning(f"⚠️ Invalid SQL query rejected: {sql_query}")
             return {"error": "Invalid SQL query - only SELECT statements allowed", "results": []}
         
-        logger.info(f"Executing query for business {business_id[:8]}...")
+        logger.info(f"🔍 Executing query for business {business_id[:8]}...")
         logger.debug(f"SQL: {secured_query}")
         
         # Execute via MCP
         result = await mcp_client.execute_query(secured_query)
         
         row_count = len(result.get('rows', []))
-        logger.info(f"Query returned {row_count} rows")
+        logger.info(f"✅ Query returned {row_count} rows")
         
         return {
             "success": True,
@@ -109,76 +109,95 @@ async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
         }
         
     except Exception as e:
-        logger.error(f"MCP execution error: {str(e)}")
+        logger.error(f"❌ MCP execution error: {str(e)}")
         return {
             "error": f"Database query failed: {str(e)}",
             "results": []
         }
 
+
 async def process_message(message: str, business_id: str, user_id: str) -> str:
-    """Process user message with OpenRouter"""
+    """Process user message with Anthropic Claude"""
     
     try:
-        logger.info(f"Processing message from user {user_id[:8]}...: {message[:50]}...")
+        logger.info(f"💬 Processing message from user {user_id[:8]}...: {message[:50]}...")
         
-        # Initial LLM call with tools
-        response = await openrouter_client.chat.completions.create(
-            model=config.OPENROUTER_MODEL,
+        # STEP 1: Send message to Claude with tools available
+        response = await anthropic_client.messages.create(
+            model=config.ANTHROPIC_MODEL,
+            max_tokens=4096,
+            system=get_system_prompt(business_id),
             messages=[
-                {"role": "system", "content": get_system_prompt(business_id)},
                 {"role": "user", "content": message}
             ],
             tools=MCP_TOOLS,
-            tool_choice="auto",
-            extra_headers={
-                "HTTP-Referer": "https://msme-assistant.app",
-                "X-Title": "MSME Business Assistant"
-            }
         )
         
-        message_obj = response.choices[0].message
+        logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
         
-        # Check if LLM wants to use tools (query database)
-        if message_obj.tool_calls:
-            tool_call = message_obj.tool_calls[0]
-            function_args = json.loads(tool_call.function.arguments)
+        # STEP 2: Check if Claude wants to use tools (query database)
+        if response.stop_reason == "tool_use":
+            # Find the tool use block
+            tool_use = next(block for block in response.content if block.type == "tool_use")
+            tool_name = tool_use.name
+            tool_input = tool_use.input
             
-            logger.info(f"Tool requested: {tool_call.function.name}")
-            if 'explanation' in function_args:
-                logger.info(f"Query explanation: {function_args['explanation']}")
+            logger.info(f"🔧 Tool requested: {tool_name}")
+            if 'explanation' in tool_input:
+                logger.info(f"📝 Query explanation: {tool_input['explanation']}")
             
-            # Execute database query
+            # STEP 3: Execute database query via MCP
             tool_result = await execute_mcp_tool(
-                function_args['query'],
+                tool_input['query'],
                 business_id
             )
             
-            # Get final response with tool results
-            final_response = await openrouter_client.chat.completions.create(
-                model=config.OPENROUTER_MODEL,
+            logger.info(f"📊 Tool execution complete. Success: {tool_result.get('success', False)}")
+            
+            # STEP 4: Send tool result back to Claude for final response
+            final_response = await anthropic_client.messages.create(
+                model=config.ANTHROPIC_MODEL,
+                max_tokens=4096,
+                system=get_system_prompt(business_id),
                 messages=[
-                    {"role": "system", "content": get_system_prompt(business_id)},
                     {"role": "user", "content": message},
-                    {"role": "assistant", "content": None, "tool_calls": message_obj.tool_calls},
+                    {"role": "assistant", "content": response.content},
                     {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(tool_result)
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use.id,
+                                "content": json.dumps(tool_result),
+                            }
+                        ],
                     }
-                ]
+                ],
+                tools=MCP_TOOLS,
             )
             
-            response_content = final_response.choices[0].message.content
-            logger.info(f"Response generated (with data): {len(response_content)} chars")
-            return response_content
+            # Extract text response
+            text_content = next(
+                (block.text for block in final_response.content if hasattr(block, "text")),
+                "I couldn't generate a response."
+            )
+            
+            logger.info(f"✅ Response generated (with data): {len(text_content)} chars")
+            return text_content
         
-        # No tools needed - direct response (general business advice)
-        logger.info(f"Response generated (no data): {len(message_obj.content)} chars")
-        return message_obj.content
+        # STEP 5: No tools needed - direct response (general business advice)
+        text_content = next(
+            (block.text for block in response.content if hasattr(block, "text")),
+            "I couldn't generate a response."
+        )
+        
+        logger.info(f"✅ Response generated (no data): {len(text_content)} chars")
+        return text_content
         
     except Exception as e:
-        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+        logger.error(f"❌ Error processing message: {str(e)}", exc_info=True)
         return f"I apologize, but I encountered an error: {str(e)}"
+
 
 @app.websocket("/ws/chat")
 async def chat_websocket(websocket: WebSocket):
@@ -201,11 +220,11 @@ async def chat_websocket(websocket: WebSocket):
             })
             return
         
-        logger.info(f"WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}...")
+        logger.info(f"🔌 WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}...")
         
         await websocket.send_json({
             "type": "connected",
-            "message": "Connected to Mali Daftari your personal business assistant.",
+            "message": "Connected to Mali Daftari, your personal business assistant.",
             "timestamp": datetime.utcnow().isoformat()
         })
         
@@ -217,12 +236,12 @@ async def chat_websocket(websocket: WebSocket):
             if not message:
                 continue
             
-            logger.info(f"Message received: {message[:100]}...")
+            logger.info(f"📨 Message received: {message[:100]}...")
             
-            # Process message
+            # Process message with Claude
             response = await process_message(message, business_id, user_id)
             
-            # Send response
+            # Send response back to user
             await websocket.send_json({
                 "type": "message",
                 "content": response,
@@ -230,9 +249,9 @@ async def chat_websocket(websocket: WebSocket):
             })
             
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}")
+        logger.info(f"🔌 WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}")
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}", exc_info=True)
+        logger.error(f"❌ WebSocket error: {str(e)}", exc_info=True)
         try:
             await websocket.send_json({
                 "type": "error",
@@ -240,6 +259,7 @@ async def chat_websocket(websocket: WebSocket):
             })
         except:
             pass
+
 
 @app.get("/health")
 async def health_check():
@@ -252,30 +272,35 @@ async def health_check():
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "mcp_server": "connected" if mcp_status else "disconnected",
-            "model": config.OPENROUTER_MODEL,
+            "ai_provider": "Anthropic Claude",
+            "model": config.ANTHROPIC_MODEL,
             "environment": config.ENVIRONMENT
         }
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
+        logger.error(f"❌ Health check failed: {str(e)}")
         return {
             "status": "unhealthy",
             "error": str(e),
             "timestamp": datetime.utcnow().isoformat()
         }
 
+
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "service": "MSME Business Assistant",
+        "service": "Mali Daftari Business Assistant",
         "version": "1.0.0",
         "status": "running",
+        "ai_provider": "Anthropic Claude",
+        "model": config.ANTHROPIC_MODEL,
         "endpoints": {
             "websocket": "/ws/chat",
             "health": "/health",
             "docs": "/docs"
         }
     }
+
 
 if __name__ == "__main__":
     import uvicorn
