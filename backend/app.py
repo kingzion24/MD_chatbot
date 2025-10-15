@@ -205,7 +205,7 @@ async def chat_websocket(websocket: WebSocket):
         
         await websocket.send_json({
             "type": "connected",
-            "message": "Connected to MSME Business Assistant",
+            "message": "Connected to Mali Daftari your personal business assistant.",
             "timestamp": datetime.utcnow().isoformat()
         })
         
