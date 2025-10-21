@@ -1,21 +1,20 @@
-
-
 services:
-  # PostgreSQL MCP Read-Only Server
   mcp-postgres:
     build:
       context: ./mcp-server
       dockerfile: Dockerfile
     container_name: md-mcp-postgres
-    working_dir: /app
     environment:
       - DATABASE_URL=${DATABASE_URL}
+    extra_hosts:                          
+      - "host.docker.internal:host-gateway"
+    dns:                           
+      - 8.8.8.8                    
+      - 8.8.4.4                    
     ports:
       - "3000:3000"
     networks:
       - msme-network
-    volumes:
-      - ./mcp-server:/app
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
@@ -24,7 +23,6 @@ services:
       retries: 3
       start_period: 30s
 
-  # Backend API Server
   backend:
     build:
       context: ./backend
@@ -33,27 +31,25 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - USE_ANTHROPIC=true
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}
       - DATABASE_URL=${DATABASE_URL}
       - MCP_SERVER_URL=http://mcp-postgres:3000
-      - OPENROUTER_MODEL=${OPENROUTER_MODEL}
-      - LOG_LEVEL=info
-      - ENVIRONMENT=testing
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
     depends_on:
       mcp-postgres:
         condition: service_healthy
     networks:
       - msme-network
-    volumes:
-      - ./backend:/app
-      - ./logs:/app/logs
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 10s
+      retries: 5
+      start_period: 40s
 
 networks:
   msme-network:

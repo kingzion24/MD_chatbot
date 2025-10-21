@@ -4,6 +4,7 @@ import asyncpg
 import os
 import logging
 from datetime import datetime
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,7 +32,6 @@ async def health():
 @app.post("/query")
 async def execute_query(request: QueryRequest):
     database_url = os.getenv("DATABASE_URL")
-    
     if not database_url:
         logger.error("DATABASE_URL not configured")
         raise HTTPException(status_code=500, detail="DATABASE_URL not configured")
@@ -45,8 +45,18 @@ async def execute_query(request: QueryRequest):
     try:
         logger.info(f"Executing query: {request.sql[:100]}...")
         
-        # Connect to database
-        conn = await asyncpg.connect(database_url)
+        # Parse DATABASE_URL to extract components
+        parsed = urlparse(database_url)
+        
+        # Connect with explicit SSL for Supabase
+        conn = await asyncpg.connect(
+            user=parsed.username,
+            password=parsed.password,
+            database=parsed.path[1:],  # Remove leading '/'
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            ssl='require'  # Simple string for Supabase
+        )
         
         try:
             # Execute query
