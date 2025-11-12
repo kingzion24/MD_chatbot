@@ -38,6 +38,9 @@ services:
       - MCP_SERVER_URL=http://mcp-postgres:3000
       - LOG_LEVEL=INFO
       - ENVIRONMENT=production
+    volumes:
+      # Cache translation models
+      - translation-models-cache:/root/.cache/huggingface
     depends_on:
       mcp-postgres:
         condition: service_healthy
@@ -49,8 +52,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 40s
+      start_period: 90s  # Translation models need time to load
 
 networks:
   msme-network:
     driver: bridge
+
+volumes:
+  translation-models-cache:
+    driver: local
