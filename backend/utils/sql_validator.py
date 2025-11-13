@@ -4,8 +4,8 @@ from typing import Optional
 
 def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
     """Validate and secure SQL query"""
-    
-    sql = sql.strip()
+    # Normalize whitespace
+    sql = ' '.join(sql.split())
     sql_upper = sql.upper()
     
     # Must be SELECT only
@@ -15,8 +15,8 @@ def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
     # Block dangerous keywords
     dangerous = [
         'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 
-        'CREATE', 'TRUNCATE', 'EXEC', 'EXECUTE', '--', ';--',
-        'PRAGMA', 'GRANT', 'REVOKE'
+        'CREATE', 'TRUNCATE', 'EXEC', 'EXECUTE',
+        'PRAGMA', 'GRANT', 'REVOKE', ';--'
     ]
     
     for keyword in dangerous:
@@ -32,44 +32,48 @@ def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
     
     return sql
 
+
 def add_business_filter(sql: str, business_id: str) -> str:
-    """Add business_id filter to SQL query"""
+    """Add business_id filter using simple string replacement"""
     
+    safe_business_id = business_id.replace("'", "''")
     sql_upper = sql.upper()
     
-    # Escape single quotes in business_id
-    safe_business_id = business_id.replace("'", "''")
+    # Already has business_id filter
+    if 'BUSINESS_ID' in sql_upper:
+        return sql
     
-    # Different patterns for WHERE clause injection
+    # Get table info
+    from_match = re.search(r'FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?', sql, re.IGNORECASE)
+    if not from_match:
+        return sql
+    
+    # Use alias if present, otherwise use table name
+    table_alias = from_match.group(2) if from_match.group(2) else from_match.group(1)
+    business_filter = f"{table_alias}.business_id = '{safe_business_id}'"
+    
+    # If query has WHERE, add to it
     if ' WHERE ' in sql_upper:
-        # Find WHERE and insert after it
-        where_idx = sql_upper.find(' WHERE ') + 7
-        return (
-            sql[:where_idx] + 
-            f"business_id = '{safe_business_id}' AND " + 
-            sql[where_idx:]
+        return re.sub(
+            r'\bWHERE\b',
+            f'WHERE {business_filter} AND',
+            sql,
+            count=1,
+            flags=re.IGNORECASE
         )
-    elif ' GROUP BY ' in sql_upper:
-        group_idx = sql_upper.find(' GROUP BY ')
-        return (
-            sql[:group_idx] + 
-            f" WHERE business_id = '{safe_business_id}' " + 
-            sql[group_idx:]
-        )
-    elif ' ORDER BY ' in sql_upper:
-        order_idx = sql_upper.find(' ORDER BY ')
-        return (
-            sql[:order_idx] + 
-            f" WHERE business_id = '{safe_business_id}' " + 
-            sql[order_idx:]
-        )
-    elif ' LIMIT ' in sql_upper:
-        limit_idx = sql_upper.find(' LIMIT ')
-        return (
-            sql[:limit_idx] + 
-            f" WHERE business_id = '{safe_business_id}' " + 
-            sql[limit_idx:]
-        )
-    else:
-        # Simple append
-        return sql.rstrip(';') + f" WHERE business_id = '{safe_business_id}'"
+    
+    # No WHERE - need to insert it before GROUP/ORDER/LIMIT/HAVING
+    # Find the first occurrence of these keywords
+    insertion_point = None
+    for clause in ['GROUP BY', 'HAVING', 'ORDER BY', 'LIMIT', 'OFFSET']:
+        match = re.search(rf'\b{clause}\b', sql, re.IGNORECASE)
+        if match:
+            if insertion_point is None or match.start() < insertion_point:
+                insertion_point = match.start()
+    
+    if insertion_point is not None:
+        # Insert WHERE before the found clause
+        return sql[:insertion_point] + f'WHERE {business_filter} ' + sql[insertion_point:]
+    
+    # No clauses found - append at end
+    return sql.rstrip(';') + f" WHERE {business_filter}"
