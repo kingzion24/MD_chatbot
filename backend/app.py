@@ -11,6 +11,8 @@ from config import Config
 from utils.sql_validator import validate_and_secure_sql
 from utils.mcp_client import MCPClient
 from prompts.system_prompt import get_system_prompt
+from translation_service import get_translation_service
+from query_router import get_query_router
 
 # Logging setup
 os.makedirs('logs', exist_ok=True)
@@ -27,17 +29,18 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI
 app = FastAPI(
     title="Mali Daftari Business Assistant API",
-    version="1.0.0",
-    description="AI-powered business assistant for MSME owners"
+    version="2.0.0",
+    description="AI-powered bilingual business assistant for MSME owners"
 )
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
 )
 
 # Validate config on startup
@@ -59,12 +62,24 @@ logger.info(f"✅ Using Anthropic Claude: {config.ANTHROPIC_MODEL}")
 mcp_client = MCPClient(config.MCP_SERVER_URL)
 logger.info(f"✅ MCP Server configured: {config.MCP_SERVER_URL}")
 
-# MCP Tools Definition (Anthropic format)
+# Initialize Translation Service
+try:
+    translation_service = get_translation_service()
+    logger.info("✅ Translation service initialized")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize translation service: {e}")
+    translation_service = None
+
+# Initialize Query Router
+query_router = get_query_router()
+logger.info("✅ Query router initialized")
+
+# MCP Tools Definition
 MCP_TOOLS = [{
     "name": "query_business_data",
     "description": """Query business data from PostgreSQL database. 
     Available tables: inventories, products, sales, expenses.
-    Use this tool ONLY when the user asks about their specific business data.
+    Use this tool when the user asks about their specific business data (sales, inventory, expenses).
     Do NOT use this for general business advice questions.""",
     "input_schema": {
         "type": "object",
@@ -86,13 +101,19 @@ MCP_TOOLS = [{
 async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
     """Execute SQL query via MCP server with security"""
     try:
-        # Validate and secure SQL
-        secured_query = validate_and_secure_sql(sql_query, business_id)
-        if not secured_query:
-            logger.warning(f"⚠️ Invalid SQL query rejected: {sql_query}")
-            return {"error": "Invalid SQL query - only SELECT statements allowed", "results": []}
+        # Use the complete validation pipeline
+        from utils.sql_validator import validate_query_complete
         
-        logger.info(f"🔍 Executing query for business {business_id[:8]}...")
+        secured_query = validate_query_complete(sql_query, business_id)
+        
+        if not secured_query:
+            logger.warning(f"⚠️ Invalid SQL query rejected: {sql_query[:50]}...")
+            return {
+                "error": "Invalid SQL query - security validation failed",
+                "results": []
+            }
+        
+        logger.info(f"🔍 Executing secured query for business {business_id[:8]}...")
         logger.debug(f"SQL: {secured_query}")
         
         # Execute via MCP
@@ -116,28 +137,60 @@ async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
         }
 
 
-async def process_message(message: str, business_id: str, user_id: str) -> str:
-    """Process user message with Anthropic Claude"""
+async def process_message_with_translation(
+    message: str, 
+    business_id: str, 
+    user_id: str
+) -> tuple[str, str]:
+    """
+    Process user message with bilingual support
+    
+    Returns:
+        (response_text, detected_language)
+    """
     
     try:
         logger.info(f"💬 Processing message from user {user_id[:8]}...: {message[:50]}...")
         
-        # STEP 1: Send message to Claude with tools available
+        # STEP 1: Detect language
+        if translation_service:
+            detected_language = translation_service.detect_language(message)
+            logger.info(f"🌍 Detected language: {detected_language.upper()}")
+            
+            # STEP 2: Translate to English if needed
+            if detected_language == "sw":
+                message_english = translation_service.translate_sw_to_en(message)
+                logger.info(f"🔄 Translated: '{message}' → '{message_english}'")
+            else:
+                message_english = message
+        else:
+            # Fallback if translation service not available
+            detected_language = "en"
+            message_english = message
+        
+        # STEP 3: Check if this is a data query or conversational query
+        is_data_query = query_router.is_data_query(message_english, detected_language)
+        
+        if is_data_query:
+            logger.info("📊 Classified as DATA QUERY - will use database if needed")
+        else:
+            logger.info("💬 Classified as CONVERSATIONAL - general advice")
+        
+        # STEP 4: Send to Claude with appropriate system prompt
         response = await anthropic_client.messages.create(
             model=config.ANTHROPIC_MODEL,
             max_tokens=4096,
-            system=get_system_prompt(business_id),
+            system=get_system_prompt(business_id, detected_language),
             messages=[
-                {"role": "user", "content": message}
+                {"role": "user", "content": message_english}
             ],
-            tools=MCP_TOOLS,
+            tools=MCP_TOOLS if is_data_query else [],  # Only provide tools for data queries
         )
         
         logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
         
-        # STEP 2: Check if Claude wants to use tools (query database)
+        # STEP 5: Handle tool use (database queries)
         if response.stop_reason == "tool_use":
-            # Find the tool use block
             tool_use = next(block for block in response.content if block.type == "tool_use")
             tool_name = tool_use.name
             tool_input = tool_use.input
@@ -146,7 +199,7 @@ async def process_message(message: str, business_id: str, user_id: str) -> str:
             if 'explanation' in tool_input:
                 logger.info(f"📝 Query explanation: {tool_input['explanation']}")
             
-            # STEP 3: Execute database query via MCP
+            # Execute database query
             tool_result = await execute_mcp_tool(
                 tool_input['query'],
                 business_id
@@ -154,13 +207,13 @@ async def process_message(message: str, business_id: str, user_id: str) -> str:
             
             logger.info(f"📊 Tool execution complete. Success: {tool_result.get('success', False)}")
             
-            # STEP 4: Send tool result back to Claude for final response
+            # Send tool result back to Claude for final response
             final_response = await anthropic_client.messages.create(
                 model=config.ANTHROPIC_MODEL,
                 max_tokens=4096,
-                system=get_system_prompt(business_id),
+                system=get_system_prompt(business_id, detected_language),
                 messages=[
-                    {"role": "user", "content": message},
+                    {"role": "user", "content": message_english},
                     {"role": "assistant", "content": response.content},
                     {
                         "role": "user",
@@ -176,27 +229,38 @@ async def process_message(message: str, business_id: str, user_id: str) -> str:
                 tools=MCP_TOOLS,
             )
             
-            # Extract text response
             text_content = next(
                 (block.text for block in final_response.content if hasattr(block, "text")),
                 "I couldn't generate a response."
             )
-            
-            logger.info(f"✅ Response generated (with data): {len(text_content)} chars")
-            return text_content
+        else:
+            # No tools needed - direct response
+            text_content = next(
+                (block.text for block in response.content if hasattr(block, "text")),
+                "I couldn't generate a response."
+            )
         
-        # STEP 5: No tools needed - direct response (general business advice)
-        text_content = next(
-            (block.text for block in response.content if hasattr(block, "text")),
-            "I couldn't generate a response."
-        )
+        # STEP 6: Translate response back to Kiswahili if needed
+        if translation_service and detected_language == "sw":
+            final_response_text = translation_service.translate_en_to_sw(text_content)
+            logger.info(f"🔄 Response translated back to Kiswahili")
+        else:
+            final_response_text = text_content
         
-        logger.info(f"✅ Response generated (no data): {len(text_content)} chars")
-        return text_content
+        logger.info(f"✅ Response generated: {len(final_response_text)} chars")
+        
+        return final_response_text, detected_language
         
     except Exception as e:
         logger.error(f"❌ Error processing message: {str(e)}", exc_info=True)
-        return f"I apologize, but I encountered an error: {str(e)}"
+        
+        # Return error in user's language
+        if translation_service and detected_language == "sw":
+            error_msg = "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
+        else:
+            error_msg = f"I apologize, but I encountered an error: {str(e)}"
+        
+        return error_msg, detected_language
 
 
 @app.websocket("/ws/chat")
@@ -222,9 +286,15 @@ async def chat_websocket(websocket: WebSocket):
         
         logger.info(f"🔌 WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}...")
         
+        # Send welcome message
+        welcome_msg = "Connected to Mali Daftari, your bilingual business assistant."
+        if translation_service:
+            welcome_msg += " I can communicate in both English and Kiswahili!"
+        
         await websocket.send_json({
             "type": "connected",
-            "message": "Connected to Mali Daftari, your personal business assistant.",
+            "message": welcome_msg,
+            "supports_swahili": translation_service is not None,
             "timestamp": datetime.utcnow().isoformat()
         })
         
@@ -238,13 +308,16 @@ async def chat_websocket(websocket: WebSocket):
             
             logger.info(f"📨 Message received: {message[:100]}...")
             
-            # Process message with Claude
-            response = await process_message(message, business_id, user_id)
+            # Process message with translation
+            response_text, detected_language = await process_message_with_translation(
+                message, business_id, user_id
+            )
             
             # Send response back to user
             await websocket.send_json({
                 "type": "message",
-                "content": response,
+                "content": response_text,
+                "language": detected_language,
                 "timestamp": datetime.utcnow().isoformat()
             })
             
@@ -265,16 +338,20 @@ async def chat_websocket(websocket: WebSocket):
 async def health_check():
     """Health check endpoint"""
     try:
-        # Check MCP server
         mcp_status = await mcp_client.health_check()
         
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "mcp_server": "connected" if mcp_status else "disconnected",
+            "translation": "enabled" if translation_service else "disabled",
             "ai_provider": "Anthropic Claude",
             "model": config.ANTHROPIC_MODEL,
-            "environment": config.ENVIRONMENT
+            "environment": config.ENVIRONMENT,
+            "features": {
+                "bilingual": translation_service is not None,
+                "languages": ["English", "Kiswahili"] if translation_service else ["English"]
+            }
         }
     except Exception as e:
         logger.error(f"❌ Health check failed: {str(e)}")
@@ -290,10 +367,15 @@ async def root():
     """Root endpoint"""
     return {
         "service": "Mali Daftari Business Assistant",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "ai_provider": "Anthropic Claude",
         "model": config.ANTHROPIC_MODEL,
+        "features": {
+            "bilingual_support": translation_service is not None,
+            "languages": ["English", "Kiswahili"] if translation_service else ["English"],
+            "intelligent_routing": True
+        },
         "endpoints": {
             "websocket": "/ws/chat",
             "health": "/health",
