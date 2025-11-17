@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout=1000 --retries=5 -r requirements.txt
 
 # Download translation models at build time (speeds up container startup)
 RUN python -c "from transformers import MarianMTModel, MarianTokenizer; \

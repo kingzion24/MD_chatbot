@@ -86,33 +86,44 @@ async def startup():
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         logger.error("❌ DATABASE_URL not configured")
-        raise ValueError("DATABASE_URL must be set")
+        logger.warning("⚠️ Server starting WITHOUT database connection")
+        db_pool = None
+    else:
+        try:
+            parsed = urlparse(database_url)
+            
+            logger.info(f"🔌 Connecting to database: {parsed.hostname}:{parsed.port}")
+            
+            db_pool = await asyncpg.create_pool(
+                user=parsed.username,
+                password=parsed.password,
+                database=parsed.path[1:],
+                host=parsed.hostname,
+                port=parsed.port or 5432,
+                ssl='require',
+                min_size=2,
+                max_size=10,
+                timeout=10  # Add timeout
+            )
+            
+            # Test the connection
+            async with db_pool.acquire() as conn:
+                result = await conn.fetchval('SELECT 1')
+                logger.info(f"✅ Database connection tested: {result}")
+            
+            logger.info("✅ Database pool initialized")
+            
+            # Initialize performance logger
+            performance_logger = PerformanceLogger(db_pool)
+            logger.info("✅ Performance logger initialized")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize database: {e}")
+            logger.warning("⚠️ Server starting WITHOUT database connection")
+            db_pool = None
+            performance_logger = None
     
-    try:
-        parsed = urlparse(database_url)
-        
-        db_pool = await asyncpg.create_pool(
-            user=parsed.username,
-            password=parsed.password,
-            database=parsed.path[1:],
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            ssl='require',
-            min_size=2,
-            max_size=10
-        )
-        
-        logger.info("✅ Database pool initialized")
-        
-        # Initialize performance logger
-        performance_logger = PerformanceLogger(db_pool)
-        logger.info("✅ Performance logger initialized")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize database: {e}")
-        raise
-    
-    # Initialize translation service
+    # Initialize translation service (independent of database)
     try:
         translation_service = get_translation_service()
         logger.info("✅ Translation service initialized")
@@ -122,6 +133,9 @@ async def startup():
     
     logger.info("=" * 60)
     logger.info("✅ MCP Server Ready!")
+    logger.info(f"   - Database: {'Connected' if db_pool else 'Disconnected'}")
+    logger.info(f"   - Translation: {'Enabled' if translation_service else 'Disabled'}")
+    logger.info(f"   - Performance Logging: {'Enabled' if performance_logger else 'Disabled'}")
     logger.info("=" * 60)
 
 
@@ -169,6 +183,31 @@ async def health():
     }
 
 
+@app.get("/test")
+async def test_endpoint():
+    """Simple test endpoint for debugging"""
+    return {
+        "message": "MCP server is running!",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database_connected": db_pool is not None,
+        "translation_enabled": translation_service is not None
+    }
+
+
+@app.get("/debug/routes")
+async def list_routes():
+    """Debug: List all registered routes"""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, 'path'):
+            routes.append({
+                "path": route.path,
+                "name": route.name if hasattr(route, 'name') else None,
+                "methods": list(route.methods) if hasattr(route, 'methods') else []
+            })
+    return {"routes": routes, "total": len(routes)}
+
+
 @app.post("/query")
 async def execute_query(request: QueryRequest):
     """Execute SQL query with monitoring"""
@@ -187,18 +226,8 @@ async def execute_query(request: QueryRequest):
     try:
         logger.info(f"Executing query: {request.sql[:100]}...")
         
-        # Execute query
-        parsed = urlparse(os.getenv("DATABASE_URL"))
-        conn = await asyncpg.connect(
-            user=parsed.username,
-            password=parsed.password,
-            database=parsed.path[1:],
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            ssl='require'
-        )
-        
-        try:
+        # Execute query using the pool
+        async with db_pool.acquire() as conn:
             rows = await conn.fetch(request.sql)
             result = [dict(row) for row in rows]
             
@@ -215,7 +244,7 @@ async def execute_query(request: QueryRequest):
                     detected_language="en",
                     translated_query=None,
                     query_type="data_query",
-                    sql_generated=request.sql,
+                    generated_sql=request.sql,  # FIXED: was sql_generated
                     query_success=True,
                     response_text=f"{len(result)} rows returned",
                     processing_time_ms=processing_time
@@ -236,9 +265,6 @@ async def execute_query(request: QueryRequest):
                 "columns": list(result[0].keys()) if result else [],
                 "processing_time_ms": processing_time
             }
-            
-        finally:
-            await conn.close()
             
     except asyncpg.PostgresError as e:
         logger.error(f"PostgreSQL error: {str(e)}")
@@ -320,13 +346,12 @@ async def admin_websocket(websocket: WebSocket):
     
     try:
         # Send initial metrics
-        if db_pool:
-            metrics = await get_realtime_metrics()
-            await websocket.send_json({
-                "type": "initial_metrics",
-                "data": metrics,
-                "timestamp": datetime.utcnow().isoformat()
-            })
+        metrics = await get_realtime_metrics()
+        await websocket.send_json({
+            "type": "initial_metrics",
+            "data": metrics,
+            "timestamp": datetime.utcnow().isoformat()
+        })
         
         # Keep connection alive and send periodic updates
         while True:
@@ -378,7 +403,23 @@ async def get_realtime_metrics() -> dict:
     """Get real-time metrics for admin panel"""
     
     if not db_pool:
-        return {}
+        logger.warning("⚠️ Database not available for metrics")
+        return {
+            "status": "database_unavailable",
+            "today": {
+                "total_queries": 0,
+                "successful_queries": 0,
+                "avg_response_time": 0,
+                "active_businesses": 0,
+                "swahili_queries": 0,
+                "english_queries": 0
+            },
+            "last_hour": {
+                "queries_last_hour": 0,
+                "avg_time_last_hour": 0
+            },
+            "recent_interactions": []
+        }
     
     try:
         async with db_pool.acquire() as conn:
@@ -418,6 +459,7 @@ async def get_realtime_metrics() -> dict:
             """)
             
             return {
+                "status": "healthy",
                 "today": dict(today_stats) if today_stats else {},
                 "last_hour": dict(last_hour) if last_hour else {},
                 "recent_interactions": [dict(r) for r in recent]
@@ -425,7 +467,13 @@ async def get_realtime_metrics() -> dict:
             
     except Exception as e:
         logger.error(f"Failed to get metrics: {e}")
-        return {}
+        return {
+            "status": "error",
+            "error": str(e),
+            "today": {},
+            "last_hour": {},
+            "recent_interactions": []
+        }
 
 
 # ============================================
@@ -435,7 +483,10 @@ async def get_realtime_metrics() -> dict:
 @app.get("/admin/metrics/live")
 async def get_live_metrics():
     """Get current live metrics"""
-    return await get_realtime_metrics()
+    logger.info("📊 Admin metrics requested via HTTP")
+    metrics = await get_realtime_metrics()
+    logger.info(f"✅ Returning metrics: {len(metrics)} keys")
+    return metrics
 
 
 @app.get("/admin/metrics/summary")
@@ -458,7 +509,7 @@ async def get_metrics_summary(days: int = 7):
                     COUNT(*) FILTER (WHERE query_type = 'data_query') as data_queries,
                     COUNT(*) FILTER (WHERE query_type = 'conversational') as conversational_queries
                 FROM agent_interactions
-                WHERE created_at >= CURRENT_DATE - INTERVAL '$1 days'
+                WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' * $1
             """, days)
             
             return dict(summary) if summary else {}

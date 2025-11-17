@@ -27,7 +27,7 @@ class PerformanceLogger:
         detected_language: str,
         translated_query: Optional[str],
         query_type: str,
-        sql_generated: Optional[str],
+        generated_sql: Optional[str],  # FIXED: was sql_generated
         query_success: bool,
         response_text: str,
         processing_time_ms: int,
@@ -60,7 +60,7 @@ class PerformanceLogger:
                     interaction_id, business_id, session_id,
                     original_query, detected_language,
                     translated_query, query_type,
-                    sql_generated, query_success,
+                    generated_sql, query_success,
                     response_text, detected_language,
                     processing_time_ms,
                     error_message

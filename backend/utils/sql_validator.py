@@ -11,11 +11,9 @@ logger = logging.getLogger(__name__)
 
 
 def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
-<<<<<<< HEAD
     """Validate and secure SQL query"""
     # Normalize whitespace
     sql = ' '.join(sql.split())
-=======
     """
     Validate and secure SQL query
     
@@ -32,7 +30,6 @@ def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
     # Remove markdown code blocks if present
     sql = sql.replace('```sql', '').replace('```', '').strip()
     
->>>>>>> c3b5854c64677957061d72491917de8be00c8e53
     sql_upper = sql.upper()
     
     # Must be SELECT only
@@ -43,14 +40,9 @@ def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
     # Block dangerous keywords
     dangerous = [
         'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 
-<<<<<<< HEAD
-        'CREATE', 'TRUNCATE', 'EXEC', 'EXECUTE',
-        'PRAGMA', 'GRANT', 'REVOKE', ';--'
-=======
         'CREATE', 'TRUNCATE', 'EXEC', 'EXECUTE', '--', ';--',
         'PRAGMA', 'GRANT', 'REVOKE', 'INTO', 'INFORMATION_SCHEMA',
         'PG_', 'COPY', 'VACUUM'
->>>>>>> c3b5854c64677957061d72491917de8be00c8e53
     ]
     
     for keyword in dangerous:
@@ -81,9 +73,6 @@ def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
 
 
 def add_business_filter(sql: str, business_id: str) -> str:
-<<<<<<< HEAD
-    """Add business_id filter using simple string replacement"""
-=======
     """
     Add business_id filter to SQL query
     Critical security function - ensures data isolation
@@ -95,51 +84,10 @@ def add_business_filter(sql: str, business_id: str) -> str:
     Returns:
         SQL with business_id filter injected
     """
->>>>>>> c3b5854c64677957061d72491917de8be00c8e53
     
     safe_business_id = business_id.replace("'", "''")
     sql_upper = sql.upper()
     
-<<<<<<< HEAD
-    # Already has business_id filter
-    if 'BUSINESS_ID' in sql_upper:
-        return sql
-    
-    # Get table info
-    from_match = re.search(r'FROM\s+(\w+)(?:\s+(?:AS\s+)?(\w+))?', sql, re.IGNORECASE)
-    if not from_match:
-        return sql
-    
-    # Use alias if present, otherwise use table name
-    table_alias = from_match.group(2) if from_match.group(2) else from_match.group(1)
-    business_filter = f"{table_alias}.business_id = '{safe_business_id}'"
-    
-    # If query has WHERE, add to it
-    if ' WHERE ' in sql_upper:
-        return re.sub(
-            r'\bWHERE\b',
-            f'WHERE {business_filter} AND',
-            sql,
-            count=1,
-            flags=re.IGNORECASE
-        )
-    
-    # No WHERE - need to insert it before GROUP/ORDER/LIMIT/HAVING
-    # Find the first occurrence of these keywords
-    insertion_point = None
-    for clause in ['GROUP BY', 'HAVING', 'ORDER BY', 'LIMIT', 'OFFSET']:
-        match = re.search(rf'\b{clause}\b', sql, re.IGNORECASE)
-        if match:
-            if insertion_point is None or match.start() < insertion_point:
-                insertion_point = match.start()
-    
-    if insertion_point is not None:
-        # Insert WHERE before the found clause
-        return sql[:insertion_point] + f'WHERE {business_filter} ' + sql[insertion_point:]
-    
-    # No clauses found - append at end
-    return sql.rstrip(';') + f" WHERE {business_filter}"
-=======
     # Escape single quotes in business_id (prevent SQL injection)
     safe_business_id = business_id.replace("'", "''")
     
@@ -280,4 +228,3 @@ def validate_query_complete(sql: str, business_id: str) -> Optional[str]:
     logger.info(f"✅ Query validated successfully")
     
     return secured_sql
->>>>>>> c3b5854c64677957061d72491917de8be00c8e53
