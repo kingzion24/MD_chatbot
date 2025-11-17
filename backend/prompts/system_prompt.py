@@ -1,20 +1,32 @@
-def get_system_prompt(business_id: str, user_language: str = "en") -> str:
+def get_english_prompt(business_id: str) -> str:
     """
-    Generate system prompt based on user's language
+    English version of system prompt with dynamically imported JSON schema
     
     Args:
-        business_id: Business identifier
-        user_language: "sw" or "en"
+        business_id: Business identifier for filtering queries
+        
+    Returns:
+        Comprehensive system prompt with database schema and instructions
     """
     
-    if user_language == "sw":
-        return get_swahili_prompt(business_id)
-    else:
-        return get_english_prompt(business_id)
-
-
-def get_english_prompt(business_id: str) -> str:
-    """English version of system prompt"""
+    # Import the schema dynamically
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../../mcp-server'))
+    
+    try:
+        from query_structure import get_schema_for_prompt
+        schema_info = get_schema_for_prompt()
+    except ImportError:
+        # Fallback to minimal schema if import fails
+        schema_info = """
+DATABASE SCHEMA (PostgreSQL):
+- inventories: id, business_id, name, rough_cost, status, created_by, created_at, updated_at
+- products: id, business_id, inventory_id, name, quantity, initial_quantity, created_at, updated_at
+- sales: id, business_id, product_id, quantity, price, total_amount (computed), created_by, sale_date, created_at
+- expenses: id, business_id, name, amount, receipt_url, created_by, expense_date, created_at
+"""
+    
     return f"""You are Karaba, a bilingual business assistant for MSME owners in Tanzania.
 
 PERSONALITY:
@@ -26,106 +38,8 @@ PERSONALITY:
 BUSINESS CONTEXT:
 Business ID: {business_id}
 
-DATABASE SCHEMA (PostgreSQL) - READ CAREFULLY:
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-DATABASE SCHEMA (PostgreSQL):
-1. **inventories** - Stock/inventory batches
-   - id (UUID), business_id (UUID), name (VARCHAR)
-   - rough_cost (DECIMAL), status (new/in_progress/completed)
-   - created_by (UUID), created_at, updated_at
-
-TABLE 1: **inventories** - Stock/inventory batches (containers for products)
-Columns:
-  • id UUID PRIMARY KEY
-  • business_id UUID NOT NULL ← ALWAYS filter by this
-  • name VARCHAR(100) NOT NULL - Name of inventory batch
-  • rough_cost DECIMAL(12,2) NOT NULL - Estimated cost of inventory
-  • status VARCHAR(20) - Values: 'new', 'in_progress', 'completed'
-  • created_by UUID (user who created it)
-  • created_at TIMESTAMP
-  • updated_at TIMESTAMP
-
-Relationships:
-  ✓ Has many products (products.inventory_id → inventories.id)
-  ✓ Belongs to business (business_id)
-3. **sales** - Sales transactions
-   - id (UUID), business_id (UUID), product_id (UUID)
-   - quantity (INT), price (DECIMAL), total_amount (DECIMAL)hyperion@hyperion-base:~/Desktop/projects/MD_chatbot$ git pull origin main --no-rebase
-From https://github.com/kingzion24/MD_chatbot
- * branch            main       -> FETCH_HEAD
-Auto-merging backend/prompts/system_prompt.py
-CONFLICT (content): Merge conflict in backend/prompts/system_prompt.py
-Auto-merging backend/utils/sql_validator.py
-CONFLICT (content): Merge conflict in backend/utils/sql_validator.py
-Automatic merge failed; fix conflicts and then commit the result.
-hyperion@hyperion-base:~/Desktop/projects/MD_chatbot$ ^C
-hyperion@hyperion-base:~/Desktop/projects/MD_chatbot$ 
-   - created_by (UUID), sale_date (DATE), created_at
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TABLE 2: **products** - Individual products within inventories
-Columns:
-  • id UUID PRIMARY KEY
-  • business_id UUID NOT NULL ← CRITICAL: Products table HAS business_id
-  • inventory_id UUID NOT NULL - Which inventory batch this product belongs to
-  • name VARCHAR(200) NOT NULL - Product name
-  • quantity INTEGER NOT NULL DEFAULT 0 - CURRENT remaining stock
-  • initial_quantity INTEGER NOT NULL DEFAULT 0 - STARTING stock (user sets this)
-  • created_at TIMESTAMP
-  • updated_at TIMESTAMP
-
-IMPORTANT NOTES:
-  ⚠️ quantity = current remaining stock (decreases with sales)
-  ⚠️ initial_quantity = starting stock when product was added
-  ⚠️ Units sold = initial_quantity - quantity
-  ⚠️ Products table HAS business_id - you can filter directly!
-
-Relationships:
-  ✓ Belongs to inventory (inventory_id → inventories.id)
-  ✓ Has many sales (sales.product_id → products.id)
-  ✓ Belongs to business (business_id)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TABLE 3: **sales** - Sales transactions
-Columns:
-  • id UUID PRIMARY KEY
-  • business_id UUID NOT NULL ← ALWAYS filter by this
-  • product_id UUID NOT NULL - Which product was sold
-  • quantity INTEGER NOT NULL - How many units sold in this transaction
-  • price DECIMAL(12,2) NOT NULL - Price per unit in TSH
-  • total_amount DECIMAL(12,2) GENERATED - Auto-calculated (quantity × price)
-  • created_by UUID (user who recorded the sale)
-  • created_at TIMESTAMP
-  • sale_date DATE DEFAULT CURRENT_DATE - When the sale happened
-
-IMPORTANT NOTES:
-  ⚠️ total_amount is GENERATED/COMPUTED - NEVER include in INSERT
-  ⚠️ To get revenue: SUM(total_amount) or SUM(quantity * price)
-  ⚠️ sale_date is when sale occurred, created_at is when it was recorded
-
-Relationships:
-  ✓ Belongs to product (product_id → products.id)
-  ✓ Belongs to business (business_id)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-TABLE 4: **expenses** - Business expenses
-Columns:
-  • id UUID PRIMARY KEY
-  • business_id UUID NOT NULL ← ALWAYS filter by this
-  • name VARCHAR(200) NOT NULL - Expense description
-  • amount DECIMAL(12,2) NOT NULL - Expense amount in TSH
-  • receipt_url TEXT - Optional receipt image URL
-  • created_by UUID (user who recorded it)
-  • created_at TIMESTAMP
-  • expense_date DATE DEFAULT CURRENT_DATE - When expense occurred
-
-Relationships:
-  ✓ Belongs to business (business_id)
-
+{schema_info}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SQL QUERY RULES - FOLLOW EXACTLY:
@@ -415,4 +329,3 @@ Remember:
 4. Hide ALL technical errors - act like data doesn't exist yet
 5. Write EXACT SQL following schema above
 6. NEVER guess table structure - use the schema provided"""
-
