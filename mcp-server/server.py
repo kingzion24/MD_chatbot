@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from typing import Optional, Dict, Set
 import time
 import json
+import uuid
 
 from translation_service import get_translation_service
 from performance_logger import PerformanceLogger
@@ -35,7 +36,7 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,13 +61,30 @@ class QueryRequest(BaseModel):
     business_id: Optional[str] = None
     session_id: Optional[str] = None
 
+
 class TranslateRequest(BaseModel):
     text: str
     source_lang: str  # "sw" or "en"
     target_lang: str  # "sw" or "en"
 
+
 class DetectLanguageRequest(BaseModel):
     text: str
+
+
+class LogInteractionRequest(BaseModel):
+    business_id: str
+    session_id: str
+    original_query: str
+    detected_language: str
+    translated_query: Optional[str] = None
+    query_type: str
+    generated_sql: Optional[str] = None
+    query_success: bool
+    response_text: str
+    response_language: str
+    total_processing_time_ms: int
+    error_message: Optional[str] = None
 
 
 # ============================================
@@ -103,7 +121,7 @@ async def startup():
                 ssl='require',
                 min_size=2,
                 max_size=10,
-                timeout=10  # Add timeout
+                timeout=10
             )
             
             # Test the connection
@@ -194,20 +212,6 @@ async def test_endpoint():
     }
 
 
-@app.get("/debug/routes")
-async def list_routes():
-    """Debug: List all registered routes"""
-    routes = []
-    for route in app.routes:
-        if hasattr(route, 'path'):
-            routes.append({
-                "path": route.path,
-                "name": route.name if hasattr(route, 'name') else None,
-                "methods": list(route.methods) if hasattr(route, 'methods') else []
-            })
-    return {"routes": routes, "total": len(routes)}
-
-
 @app.post("/query")
 async def execute_query(request: QueryRequest):
     """Execute SQL query with monitoring"""
@@ -235,21 +239,6 @@ async def execute_query(request: QueryRequest):
             
             logger.info(f"✅ Query successful: {len(result)} rows in {processing_time}ms")
             
-            # Log to performance database (if available)
-            if performance_logger and request.business_id:
-                await performance_logger.log_interaction(
-                    business_id=request.business_id,
-                    session_id=request.session_id or "unknown",
-                    original_query=request.sql,
-                    detected_language="en",
-                    translated_query=None,
-                    query_type="data_query",
-                    generated_sql=request.sql,  # FIXED: was sql_generated
-                    query_success=True,
-                    response_text=f"{len(result)} rows returned",
-                    processing_time_ms=processing_time
-                )
-            
             # Broadcast to admin panel
             await broadcast_to_admins({
                 "type": "query_executed",
@@ -273,6 +262,85 @@ async def execute_query(request: QueryRequest):
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+
+
+# ============================================
+# INTERACTION LOGGING ENDPOINT
+# ============================================
+
+@app.post("/log-interaction")
+async def log_interaction(request: LogInteractionRequest):
+    """
+    Log AI agent interaction for monitoring and analytics
+    This is called by the backend after each user interaction
+    """
+    
+    if not db_pool:
+        logger.warning("⚠️ Database not available - cannot log interaction")
+        return {"status": "skipped", "reason": "database_unavailable"}
+    
+    try:
+        interaction_id = str(uuid.uuid4())
+        
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO agent_interactions (
+                    id,
+                    business_id,
+                    session_id,
+                    original_query,
+                    detected_language,
+                    translated_query,
+                    query_type,
+                    generated_sql,
+                    query_success,
+                    response_text,
+                    response_language,
+                    total_processing_time_ms,
+                    error_message,
+                    created_at
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW()
+                )
+            """,
+                interaction_id,
+                request.business_id,
+                request.session_id,
+                request.original_query,
+                request.detected_language,
+                request.translated_query,
+                request.query_type,
+                request.generated_sql,
+                request.query_success,
+                request.response_text,
+                request.response_language,
+                request.total_processing_time_ms,
+                request.error_message
+            )
+        
+        logger.info(f"📝 Logged interaction: {interaction_id} (business: {request.business_id[:8]}..., type: {request.query_type}, success: {request.query_success})")
+        
+        # Broadcast to admin panel
+        await broadcast_to_admins({
+            "type": "interaction_logged",
+            "interaction_id": interaction_id,
+            "business_id": request.business_id,
+            "query_type": request.query_type,
+            "language": request.detected_language,
+            "success": request.query_success,
+            "processing_time_ms": request.total_processing_time_ms,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+        return {
+            "status": "success",
+            "interaction_id": interaction_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to log interaction: {e}")
+        raise HTTPException(status_code=500, detail=f"Logging failed: {str(e)}")
 
 
 # ============================================
@@ -330,6 +398,79 @@ async def detect_language(request: DetectLanguageRequest):
 
 
 # ============================================
+# ADMIN PANEL - METRICS ENDPOINTS
+# ============================================
+
+@app.get("/admin/metrics/live")
+async def get_live_metrics():
+    """Get real-time metrics for admin panel (HTTP polling version)"""
+    
+    if not db_pool:
+        return {
+            "status": "database_unavailable",
+            "timestamp": datetime.utcnow().isoformat(),
+            "today": {},
+            "last_hour": {},
+            "recent_interactions": []
+        }
+    
+    try:
+        async with db_pool.acquire() as conn:
+            # Today's stats
+            today_stats = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*) as total_queries,
+                    COUNT(*) FILTER (WHERE query_success = true) as successful_queries,
+                    ROUND(AVG(total_processing_time_ms)) as avg_response_time,
+                    COUNT(DISTINCT business_id) as active_businesses,
+                    COUNT(*) FILTER (WHERE detected_language = 'sw') as swahili_queries,
+                    COUNT(*) FILTER (WHERE detected_language = 'en') as english_queries
+                FROM agent_interactions
+                WHERE DATE(created_at) = CURRENT_DATE
+            """)
+            
+            # Last hour stats
+            last_hour = await conn.fetchrow("""
+                SELECT 
+                    COUNT(*) as queries_last_hour,
+                    ROUND(AVG(total_processing_time_ms)) as avg_time_last_hour
+                FROM agent_interactions
+                WHERE created_at >= NOW() - INTERVAL '1 hour'
+            """)
+            
+            # Recent interactions (last 10)
+            recent = await conn.fetch("""
+                SELECT 
+                    original_query,
+                    detected_language,
+                    query_type,
+                    query_success,
+                    total_processing_time_ms,
+                    created_at
+                FROM agent_interactions
+                ORDER BY created_at DESC
+                LIMIT 10
+            """)
+            
+            return {
+                "status": "healthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "today": dict(today_stats) if today_stats else {},
+                "last_hour": dict(last_hour) if last_hour else {},
+                "recent_interactions": [
+                    {
+                        **dict(r),
+                        "created_at": r['created_at'].isoformat() if r['created_at'] else None
+                    } for r in recent
+                ]
+            }
+            
+    except Exception as e:
+        logger.error(f"Failed to get metrics: {e}")
+        raise HTTPException(status_code=500, detail=f"Metrics retrieval failed: {str(e)}")
+
+
+# ============================================
 # ADMIN PANEL - REAL-TIME WEBSOCKET
 # ============================================
 
@@ -346,16 +487,16 @@ async def admin_websocket(websocket: WebSocket):
     
     try:
         # Send initial metrics
-        metrics = await get_realtime_metrics()
-        await websocket.send_json({
-            "type": "initial_metrics",
-            "data": metrics,
-            "timestamp": datetime.utcnow().isoformat()
-        })
+        if db_pool:
+            metrics = await get_realtime_metrics()
+            await websocket.send_json({
+                "type": "initial_metrics",
+                "data": metrics,
+                "timestamp": datetime.utcnow().isoformat()
+            })
         
-        # Keep connection alive and send periodic updates
+        # Keep connection alive and handle requests
         while True:
-            # Wait for ping or send periodic updates
             try:
                 data = await websocket.receive_json()
                 
@@ -363,12 +504,13 @@ async def admin_websocket(websocket: WebSocket):
                     await websocket.send_json({"type": "pong"})
                 
                 elif data.get("type") == "request_metrics":
-                    metrics = await get_realtime_metrics()
-                    await websocket.send_json({
-                        "type": "metrics_update",
-                        "data": metrics,
-                        "timestamp": datetime.utcnow().isoformat()
-                    })
+                    if db_pool:
+                        metrics = await get_realtime_metrics()
+                        await websocket.send_json({
+                            "type": "metrics_update",
+                            "data": metrics,
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
                     
             except WebSocketDisconnect:
                 break
@@ -403,21 +545,10 @@ async def get_realtime_metrics() -> dict:
     """Get real-time metrics for admin panel"""
     
     if not db_pool:
-        logger.warning("⚠️ Database not available for metrics")
         return {
             "status": "database_unavailable",
-            "today": {
-                "total_queries": 0,
-                "successful_queries": 0,
-                "avg_response_time": 0,
-                "active_businesses": 0,
-                "swahili_queries": 0,
-                "english_queries": 0
-            },
-            "last_hour": {
-                "queries_last_hour": 0,
-                "avg_time_last_hour": 0
-            },
+            "today": {},
+            "last_hour": {},
             "recent_interactions": []
         }
     
@@ -476,49 +607,6 @@ async def get_realtime_metrics() -> dict:
         }
 
 
-# ============================================
-# ADMIN API ENDPOINTS
-# ============================================
-
-@app.get("/admin/metrics/live")
-async def get_live_metrics():
-    """Get current live metrics"""
-    logger.info("📊 Admin metrics requested via HTTP")
-    metrics = await get_realtime_metrics()
-    logger.info(f"✅ Returning metrics: {len(metrics)} keys")
-    return metrics
-
-
-@app.get("/admin/metrics/summary")
-async def get_metrics_summary(days: int = 7):
-    """Get metrics summary for last N days"""
-    
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="Database not initialized")
-    
-    try:
-        async with db_pool.acquire() as conn:
-            summary = await conn.fetchrow("""
-                SELECT 
-                    COUNT(*) as total_queries,
-                    COUNT(*) FILTER (WHERE query_success = true) as successful_queries,
-                    ROUND(AVG(total_processing_time_ms)) as avg_response_time,
-                    COUNT(DISTINCT business_id) as total_businesses,
-                    COUNT(*) FILTER (WHERE detected_language = 'sw') as swahili_queries,
-                    COUNT(*) FILTER (WHERE detected_language = 'en') as english_queries,
-                    COUNT(*) FILTER (WHERE query_type = 'data_query') as data_queries,
-                    COUNT(*) FILTER (WHERE query_type = 'conversational') as conversational_queries
-                FROM agent_interactions
-                WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' * $1
-            """, days)
-            
-            return dict(summary) if summary else {}
-            
-    except Exception as e:
-        logger.error(f"Failed to get summary: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

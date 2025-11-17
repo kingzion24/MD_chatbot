@@ -6,9 +6,11 @@ from datetime import datetime
 from anthropic import AsyncAnthropic
 from typing import Dict
 import logging
+import time
+import uuid
 
 from config import Config
-from utils.sql_validator import validate_and_secure_sql
+from utils.sql_validator import validate_query_complete
 from utils.mcp_client import MCPClient
 from prompts.system_prompt import get_system_prompt
 from translation_service import get_translation_service
@@ -36,11 +38,11 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"],  # Expose all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Validate config on startup
@@ -80,17 +82,19 @@ MCP_TOOLS = [{
     "description": """Query business data from PostgreSQL database. 
     Available tables: inventories, products, sales, expenses.
     Use this tool when the user asks about their specific business data (sales, inventory, expenses).
-    Do NOT use this for general business advice questions.""",
+    Do NOT use this for general business advice questions.
+    
+    CRITICAL: Execute this tool silently - users should NEVER see the SQL query, only the results.""",
     "input_schema": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "SQL SELECT query to execute (read-only). Always use proper JOINs."
+                "description": "SQL SELECT query to execute (read-only). Always use proper JOINs. Include business_id filter."
             },
             "explanation": {
                 "type": "string",
-                "description": "Brief explanation of what this query does"
+                "description": "Brief explanation of what this query does (for logging purposes only, NOT shown to user)"
             }
         },
         "required": ["query"]
@@ -99,18 +103,18 @@ MCP_TOOLS = [{
 
 
 async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
-    """Execute SQL query via MCP server with security"""
+    """Execute SQL query via MCP server with security validation"""
     try:
-        # Use the complete validation pipeline
-        from utils.sql_validator import validate_query_complete
-        
+        # Validate and secure the query
         secured_query = validate_query_complete(sql_query, business_id)
         
         if not secured_query:
             logger.warning(f"⚠️ Invalid SQL query rejected: {sql_query[:50]}...")
             return {
+                "success": False,
                 "error": "Invalid SQL query - security validation failed",
-                "results": []
+                "results": [],
+                "row_count": 0
             }
         
         logger.info(f"🔍 Executing secured query for business {business_id[:8]}...")
@@ -132,22 +136,76 @@ async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
     except Exception as e:
         logger.error(f"❌ MCP execution error: {str(e)}")
         return {
+            "success": False,
             "error": f"Database query failed: {str(e)}",
-            "results": []
+            "results": [],
+            "row_count": 0
         }
+
+
+async def log_interaction_to_mcp(
+    business_id: str,
+    session_id: str,
+    original_query: str,
+    detected_language: str,
+    translated_query: str,
+    query_type: str,
+    generated_sql: str,
+    query_success: bool,
+    response_text: str,
+    processing_time_ms: int,
+    error_message: str = None
+):
+    """Log interaction to MCP server for admin monitoring"""
+    try:
+        # Call MCP server's logging endpoint
+        import httpx
+        
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{config.MCP_SERVER_URL}/log-interaction",
+                json={
+                    "business_id": business_id,
+                    "session_id": session_id,
+                    "original_query": original_query,
+                    "detected_language": detected_language,
+                    "translated_query": translated_query,
+                    "query_type": query_type,
+                    "generated_sql": generated_sql,
+                    "query_success": query_success,
+                    "response_text": response_text,
+                    "response_language": detected_language,
+                    "total_processing_time_ms": processing_time_ms,
+                    "error_message": error_message
+                },
+                timeout=5.0
+            )
+            logger.debug(f"📝 Interaction logged to MCP server")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to log interaction to MCP: {e}")
 
 
 async def process_message_with_translation(
     message: str, 
     business_id: str, 
-    user_id: str
+    user_id: str,
+    session_id: str
 ) -> tuple[str, str]:
     """
-    Process user message with bilingual support
+    Process user message with bilingual support and full logging
     
     Returns:
         (response_text, detected_language)
     """
+    
+    start_time = time.time()
+    original_query = message
+    detected_language = "en"
+    translated_query = None
+    query_type = "conversational"
+    generated_sql = None
+    query_success = False
+    error_message = None
     
     try:
         logger.info(f"💬 Processing message from user {user_id[:8]}...: {message[:50]}...")
@@ -160,7 +218,8 @@ async def process_message_with_translation(
             # STEP 2: Translate to English if needed
             if detected_language == "sw":
                 message_english = translation_service.translate_sw_to_en(message)
-                logger.info(f"🔄 Translated: '{message}' → '{message_english}'")
+                translated_query = message_english
+                logger.info(f"🔄 Translated: '{message[:30]}...' → '{message_english[:30]}...'")
             else:
                 message_english = message
         else:
@@ -170,13 +229,14 @@ async def process_message_with_translation(
         
         # STEP 3: Check if this is a data query or conversational query
         is_data_query = query_router.is_data_query(message_english, detected_language)
+        query_type = "data_query" if is_data_query else "conversational"
         
         if is_data_query:
             logger.info("📊 Classified as DATA QUERY - will use database if needed")
         else:
             logger.info("💬 Classified as CONVERSATIONAL - general advice")
         
-        # STEP 4: Send to Claude with appropriate system prompt
+        # STEP 4: Send to Claude with appropriate system prompt and tools
         response = await anthropic_client.messages.create(
             model=config.ANTHROPIC_MODEL,
             max_tokens=4096,
@@ -184,7 +244,7 @@ async def process_message_with_translation(
             messages=[
                 {"role": "user", "content": message_english}
             ],
-            tools=MCP_TOOLS if is_data_query else [],  # Only provide tools for data queries
+            tools=MCP_TOOLS if is_data_query else [],
         )
         
         logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
@@ -196,6 +256,8 @@ async def process_message_with_translation(
             tool_input = tool_use.input
             
             logger.info(f"🔧 Tool requested: {tool_name}")
+            generated_sql = tool_input.get('query', '')
+            
             if 'explanation' in tool_input:
                 logger.info(f"📝 Query explanation: {tool_input['explanation']}")
             
@@ -205,7 +267,13 @@ async def process_message_with_translation(
                 business_id
             )
             
-            logger.info(f"📊 Tool execution complete. Success: {tool_result.get('success', False)}")
+            query_success = tool_result.get('success', False)
+            
+            if not query_success:
+                error_message = tool_result.get('error', 'Unknown error')
+                logger.warning(f"⚠️ Query failed: {error_message}")
+            else:
+                logger.info(f"✅ Query successful: {tool_result.get('row_count', 0)} rows")
             
             # Send tool result back to Claude for final response
             final_response = await anthropic_client.messages.create(
@@ -235,6 +303,7 @@ async def process_message_with_translation(
             )
         else:
             # No tools needed - direct response
+            query_success = True  # Conversational queries are always "successful"
             text_content = next(
                 (block.text for block in response.content if hasattr(block, "text")),
                 "I couldn't generate a response."
@@ -247,18 +316,55 @@ async def process_message_with_translation(
         else:
             final_response_text = text_content
         
-        logger.info(f"✅ Response generated: {len(final_response_text)} chars")
+        # Calculate processing time
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        
+        logger.info(f"✅ Response generated: {len(final_response_text)} chars in {processing_time_ms}ms")
+        
+        # STEP 7: Log interaction to MCP server for admin monitoring
+        await log_interaction_to_mcp(
+            business_id=business_id,
+            session_id=session_id,
+            original_query=original_query,
+            detected_language=detected_language,
+            translated_query=translated_query,
+            query_type=query_type,
+            generated_sql=generated_sql,
+            query_success=query_success,
+            response_text=final_response_text,
+            processing_time_ms=processing_time_ms,
+            error_message=error_message
+        )
         
         return final_response_text, detected_language
         
     except Exception as e:
         logger.error(f"❌ Error processing message: {str(e)}", exc_info=True)
         
+        # Calculate processing time even for errors
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        error_message = str(e)
+        
+        # Log failed interaction
+        await log_interaction_to_mcp(
+            business_id=business_id,
+            session_id=session_id,
+            original_query=original_query,
+            detected_language=detected_language,
+            translated_query=translated_query,
+            query_type=query_type,
+            generated_sql=generated_sql,
+            query_success=False,
+            response_text="Error occurred",
+            processing_time_ms=processing_time_ms,
+            error_message=error_message
+        )
+        
         # Return error in user's language
         if translation_service and detected_language == "sw":
             error_msg = "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
         else:
-            error_msg = f"I apologize, but I encountered an error: {str(e)}"
+            error_msg = "I apologize, but I encountered an error. Please try again."
         
         return error_msg, detected_language
 
@@ -270,6 +376,7 @@ async def chat_websocket(websocket: WebSocket):
     
     business_id = None
     user_id = None
+    session_id = str(uuid.uuid4())  # Generate session ID
     
     try:
         # Initialize connection
@@ -284,16 +391,17 @@ async def chat_websocket(websocket: WebSocket):
             })
             return
         
-        logger.info(f"🔌 WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}...")
+        logger.info(f"🔌 WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}..., session={session_id[:8]}...")
         
         # Send welcome message
-        welcome_msg = "Connected to Mali Daftari, your bilingual business assistant."
+        welcome_msg = "Hello! I'm Karaba, your Mali Daftari assistant 💼"
         if translation_service:
             welcome_msg += " I can communicate in both English and Kiswahili!"
         
         await websocket.send_json({
             "type": "connected",
             "message": welcome_msg,
+            "session_id": session_id,
             "supports_swahili": translation_service is not None,
             "timestamp": datetime.utcnow().isoformat()
         })
@@ -308,9 +416,9 @@ async def chat_websocket(websocket: WebSocket):
             
             logger.info(f"📨 Message received: {message[:100]}...")
             
-            # Process message with translation
+            # Process message with translation and logging
             response_text, detected_language = await process_message_with_translation(
-                message, business_id, user_id
+                message, business_id, user_id, session_id
             )
             
             # Send response back to user
@@ -322,7 +430,7 @@ async def chat_websocket(websocket: WebSocket):
             })
             
     except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}")
+        logger.info(f"🔌 WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}, session={session_id[:8]}")
     except Exception as e:
         logger.error(f"❌ WebSocket error: {str(e)}", exc_info=True)
         try:
@@ -374,7 +482,8 @@ async def root():
         "features": {
             "bilingual_support": translation_service is not None,
             "languages": ["English", "Kiswahili"] if translation_service else ["English"],
-            "intelligent_routing": True
+            "intelligent_routing": True,
+            "performance_monitoring": True
         },
         "endpoints": {
             "websocket": "/ws/chat",
