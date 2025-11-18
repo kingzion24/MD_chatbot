@@ -12,12 +12,12 @@ services:
       - 8.8.8.8                    
       - 8.8.4.4                    
     ports:
-      - "3000:3000"
+      - "3000:8000"  # ✅ FIXED: External 3000 → Internal 8000
     networks:
       - msme-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]  # ✅ FIXED: Check internal 8000
       interval: 30s
       timeout: 10s
       retries: 3
@@ -33,13 +33,12 @@ services:
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - USE_ANTHROPIC=true
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-3-5-sonnet-20241022}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
       - DATABASE_URL=${DATABASE_URL}
-      - MCP_SERVER_URL=http://mcp-postgres:3000
+      - MCP_SERVER_URL=http://mcp-postgres:8000  # ✅ CORRECT: Internal Docker network uses port 8000
       - LOG_LEVEL=INFO
       - ENVIRONMENT=production
     volumes:
-      # Cache translation models
       - translation-models-cache:/root/.cache/huggingface
     depends_on:
       mcp-postgres:
@@ -52,7 +51,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 90s  # Translation models need time to load
+      start_period: 90s
 
 networks:
   msme-network:
