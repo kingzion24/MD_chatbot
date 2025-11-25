@@ -1,10 +1,15 @@
+"""
+Mali Daftari Backend - FastAPI WebSocket Server
+Uses Claude's native multilingual capabilities for bilingual support
+"""
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import json
 import os
 from datetime import datetime
 from anthropic import AsyncAnthropic
-from typing import Dict
+from typing import Dict, Literal
 import logging
 import time
 import uuid
@@ -13,7 +18,6 @@ from config import Config
 from utils.sql_validator import validate_query_complete
 from utils.mcp_client import MCPClient
 from prompts.system_prompt import get_system_prompt
-from translation_service import get_translation_service
 from query_router import get_query_router
 
 # Logging setup
@@ -32,7 +36,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Mali Daftari Business Assistant API",
     version="2.0.0",
-    description="AI-powered bilingual business assistant for MSME owners"
+    description="AI-powered bilingual business assistant for MSME owners (using Claude's native multilingual capabilities)"
 )
 
 # CORS
@@ -64,17 +68,10 @@ logger.info(f"✅ Using Anthropic Claude: {config.ANTHROPIC_MODEL}")
 mcp_client = MCPClient(config.MCP_SERVER_URL)
 logger.info(f"✅ MCP Server configured: {config.MCP_SERVER_URL}")
 
-# Initialize Translation Service
-try:
-    translation_service = get_translation_service()
-    logger.info("✅ Translation service initialized")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize translation service: {e}")
-    translation_service = None
-
 # Initialize Query Router
 query_router = get_query_router()
 logger.info("✅ Query router initialized")
+logger.info("✅ Using Claude's native multilingual capabilities (no translation models needed)")
 
 # MCP Tools Definition
 MCP_TOOLS = [{
@@ -100,6 +97,60 @@ MCP_TOOLS = [{
         "required": ["query"]
     }
 }]
+
+
+def detect_language(text: str) -> Literal["sw", "en"]:
+    """
+    Simple keyword-based language detection
+    No ML models needed - just pattern matching
+    
+    Args:
+        text: Input text to analyze
+        
+    Returns:
+        "sw" for Kiswahili, "en" for English
+    """
+    swahili_indicators = [
+        # Greetings
+        'habari', 'mambo', 'hujambo', 'shikamoo', 'vipi', 'poa',
+        
+        # Common verbs
+        'nionyeshe', 'nina', 'niko', 'nataka', 'ninahitaji',
+        'tafadhali', 'nitumie', 'nipatie', 'naweza', 'unaweza',
+        
+        # Business terms
+        'mauzo', 'bidhaa', 'bei', 'gharama', 'faida',
+        'hifadhi', 'duka', 'mteja', 'wateja',
+        
+        # Time expressions
+        'leo', 'jana', 'kesho', 'wiki', 'mwezi', 'mwaka',
+        
+        # Question words
+        'je', 'nini', 'ngapi', 'vipi', 'lini', 'wapi', 'nani',
+        
+        # Common words
+        'ya', 'za', 'wa', 'na', 'kwa', 'au', 'ni',
+        'jumla', 'kiasi', 'pesa', 'shilingi',
+        
+        # Possessives
+        'yangu', 'yako', 'yake', 'zako', 'zangu',
+        
+        # Other common
+        'inaendeleaje', 'namna', 'siku', 'kila'
+    ]
+    
+    text_lower = text.lower()
+    
+    # Count Kiswahili indicators
+    sw_count = sum(1 for indicator in swahili_indicators if indicator in text_lower)
+    
+    # If 2 or more Kiswahili words found, classify as Kiswahili
+    if sw_count >= 2:
+        logger.debug(f"Detected Kiswahili ({sw_count} indicators found)")
+        return "sw"
+    else:
+        logger.debug(f"Detected English ({sw_count} Kiswahili indicators)")
+        return "en"
 
 
 async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
@@ -148,7 +199,6 @@ async def log_interaction_to_mcp(
     session_id: str,
     original_query: str,
     detected_language: str,
-    translated_query: str,
     query_type: str,
     generated_sql: str,
     query_success: bool,
@@ -158,7 +208,6 @@ async def log_interaction_to_mcp(
 ):
     """Log interaction to MCP server for admin monitoring"""
     try:
-        # Call MCP server's logging endpoint
         import httpx
         
         async with httpx.AsyncClient() as client:
@@ -169,7 +218,7 @@ async def log_interaction_to_mcp(
                     "session_id": session_id,
                     "original_query": original_query,
                     "detected_language": detected_language,
-                    "translated_query": translated_query,
+                    "translated_query": None,  # No translation needed - Claude speaks both languages
                     "query_type": query_type,
                     "generated_sql": generated_sql,
                     "query_success": query_success,
@@ -185,14 +234,15 @@ async def log_interaction_to_mcp(
         logger.warning(f"⚠️ Failed to log interaction to MCP: {e}")
 
 
-async def process_message_with_translation(
+async def process_message(
     message: str, 
     business_id: str, 
     user_id: str,
     session_id: str
 ) -> tuple[str, str]:
     """
-    Process user message with bilingual support and full logging
+    Process user message using Claude's native multilingual capabilities
+    Claude responds in the same language as the user's input
     
     Returns:
         (response_text, detected_language)
@@ -200,8 +250,6 @@ async def process_message_with_translation(
     
     start_time = time.time()
     original_query = message
-    detected_language = "en"
-    translated_query = None
     query_type = "conversational"
     generated_sql = None
     query_success = False
@@ -210,25 +258,12 @@ async def process_message_with_translation(
     try:
         logger.info(f"💬 Processing message from user {user_id[:8]}...: {message[:50]}...")
         
-        # STEP 1: Detect language
-        if translation_service:
-            detected_language = translation_service.detect_language(message)
-            logger.info(f"🌍 Detected language: {detected_language.upper()}")
-            
-            # STEP 2: Translate to English if needed
-            if detected_language == "sw":
-                message_english = translation_service.translate_sw_to_en(message)
-                translated_query = message_english
-                logger.info(f"🔄 Translated: '{message[:30]}...' → '{message_english[:30]}...'")
-            else:
-                message_english = message
-        else:
-            # Fallback if translation service not available
-            detected_language = "en"
-            message_english = message
+        # STEP 1: Detect language (simple keyword matching)
+        detected_language = detect_language(message)
+        logger.info(f"🌍 Detected language: {detected_language.upper()}")
         
-        # STEP 3: Check if this is a data query or conversational query
-        is_data_query = query_router.is_data_query(message_english, detected_language)
+        # STEP 2: Check if this is a data query or conversational query
+        is_data_query = query_router.is_data_query(message, detected_language)
         query_type = "data_query" if is_data_query else "conversational"
         
         if is_data_query:
@@ -236,20 +271,21 @@ async def process_message_with_translation(
         else:
             logger.info("💬 Classified as CONVERSATIONAL - general advice")
         
-        # STEP 4: Send to Claude with appropriate system prompt and tools
+        # STEP 3: Send to Claude with language-specific prompt
+        # Claude will automatically respond in the detected language
         response = await anthropic_client.messages.create(
             model=config.ANTHROPIC_MODEL,
             max_tokens=4096,
             system=get_system_prompt(business_id, detected_language),
             messages=[
-                {"role": "user", "content": message_english}
+                {"role": "user", "content": message}  # Original message - no translation!
             ],
             tools=MCP_TOOLS if is_data_query else [],
         )
         
         logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
         
-        # STEP 5: Handle tool use (database queries)
+        # STEP 4: Handle tool use (database queries)
         if response.stop_reason == "tool_use":
             tool_use = next(block for block in response.content if block.type == "tool_use")
             tool_name = tool_use.name
@@ -281,7 +317,7 @@ async def process_message_with_translation(
                 max_tokens=4096,
                 system=get_system_prompt(business_id, detected_language),
                 messages=[
-                    {"role": "user", "content": message_english},
+                    {"role": "user", "content": message},
                     {"role": "assistant", "content": response.content},
                     {
                         "role": "user",
@@ -309,25 +345,20 @@ async def process_message_with_translation(
                 "I couldn't generate a response."
             )
         
-        # STEP 6: Translate response back to Kiswahili if needed
-        if translation_service and detected_language == "sw":
-            final_response_text = translation_service.translate_en_to_sw(text_content)
-            logger.info(f"🔄 Response translated back to Kiswahili")
-        else:
-            final_response_text = text_content
+        # Claude responds in the detected language automatically - no translation needed!
+        final_response_text = text_content
         
         # Calculate processing time
         processing_time_ms = int((time.time() - start_time) * 1000)
         
-        logger.info(f"✅ Response generated: {len(final_response_text)} chars in {processing_time_ms}ms")
+        logger.info(f"✅ Response in {detected_language.upper()}: {len(final_response_text)} chars in {processing_time_ms}ms")
         
-        # STEP 7: Log interaction to MCP server for admin monitoring
+        # STEP 5: Log interaction to MCP server for admin monitoring
         await log_interaction_to_mcp(
             business_id=business_id,
             session_id=session_id,
             original_query=original_query,
             detected_language=detected_language,
-            translated_query=translated_query,
             query_type=query_type,
             generated_sql=generated_sql,
             query_success=query_success,
@@ -345,13 +376,15 @@ async def process_message_with_translation(
         processing_time_ms = int((time.time() - start_time) * 1000)
         error_message = str(e)
         
+        # Detect language for error message
+        detected_language = detect_language(message)
+        
         # Log failed interaction
         await log_interaction_to_mcp(
             business_id=business_id,
             session_id=session_id,
             original_query=original_query,
             detected_language=detected_language,
-            translated_query=translated_query,
             query_type=query_type,
             generated_sql=generated_sql,
             query_success=False,
@@ -361,7 +394,7 @@ async def process_message_with_translation(
         )
         
         # Return error in user's language
-        if translation_service and detected_language == "sw":
+        if detected_language == "sw":
             error_msg = "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
         else:
             error_msg = "I apologize, but I encountered an error. Please try again."
@@ -394,15 +427,11 @@ async def chat_websocket(websocket: WebSocket):
         logger.info(f"🔌 WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}..., session={session_id[:8]}...")
         
         # Send welcome message
-        welcome_msg = "Hello! I'm Karaba, your Mali Daftari assistant 💼"
-        if translation_service:
-            welcome_msg += " I can communicate in both English and Kiswahili!"
-        
         await websocket.send_json({
             "type": "connected",
-            "message": welcome_msg,
+            "message": "Hello! I'm Karaba, your Mali Daftari assistant 💼 (Naweza kuongea Kiswahili na Kiingereza!)",
             "session_id": session_id,
-            "supports_swahili": translation_service is not None,
+            "supports_swahili": True,
             "timestamp": datetime.utcnow().isoformat()
         })
         
@@ -416,8 +445,8 @@ async def chat_websocket(websocket: WebSocket):
             
             logger.info(f"📨 Message received: {message[:100]}...")
             
-            # Process message with translation and logging
-            response_text, detected_language = await process_message_with_translation(
+            # Process message - Claude responds in detected language
+            response_text, detected_language = await process_message(
                 message, business_id, user_id, session_id
             )
             
@@ -452,13 +481,14 @@ async def health_check():
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "mcp_server": "connected" if mcp_status else "disconnected",
-            "translation": "enabled" if translation_service else "disabled",
+            "translation": "native_multilingual",
             "ai_provider": "Anthropic Claude",
             "model": config.ANTHROPIC_MODEL,
             "environment": config.ENVIRONMENT,
             "features": {
-                "bilingual": translation_service is not None,
-                "languages": ["English", "Kiswahili"] if translation_service else ["English"]
+                "bilingual": True,
+                "languages": ["English", "Kiswahili"],
+                "translation_method": "Claude native (no external models)"
             }
         }
     except Exception as e:
@@ -480,8 +510,9 @@ async def root():
         "ai_provider": "Anthropic Claude",
         "model": config.ANTHROPIC_MODEL,
         "features": {
-            "bilingual_support": translation_service is not None,
-            "languages": ["English", "Kiswahili"] if translation_service else ["English"],
+            "bilingual_support": True,
+            "languages": ["English", "Kiswahili"],
+            "translation_method": "Claude native multilingual",
             "intelligent_routing": True,
             "performance_monitoring": True
         },

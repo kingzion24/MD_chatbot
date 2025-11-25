@@ -143,4 +143,4 @@ def get_translation_service() -> TranslationService:
     global _translation_service
     if _translation_service is None:
         _translation_service = TranslationService()
-    return _translation_service
+    return _translation_service 

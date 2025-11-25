@@ -1,6 +1,6 @@
 """
 Mali Daftari MCP Server
-Enhanced with translation, monitoring, and intelligent query processing
+Simplified with single connection pool for optimal reliability
 """
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 # FastAPI app
 app = FastAPI(
     title="Mali Daftari MCP Server",
-    version="2.0.0",
-    description="Enhanced MCP server with translation and monitoring"
+    version="2.1.0",
+    description="MCP server with single reliable connection pool"
 )
 
 # CORS
@@ -43,8 +43,9 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# Global state
-db_pool: Optional[asyncpg.Pool] = None
+# Global state - SINGLE CONNECTION POOL
+db_pool: Optional[asyncpg.Pool] = None  # Single pool for all operations
+admin_pool: Optional[asyncpg.Pool] = None  # Points to same pool as db_pool
 translation_service = None
 performance_logger = None
 
@@ -93,25 +94,28 @@ class LogInteractionRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    """Initialize services on startup"""
-    global db_pool, translation_service, performance_logger
+    """Initialize services with single reliable connection pool"""
+    global db_pool, admin_pool, translation_service, performance_logger
     
     logger.info("=" * 60)
     logger.info("🚀 Mali Daftari MCP Server Starting...")
     logger.info("=" * 60)
     
-    # Initialize database pool
+    # Initialize single database pool
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         logger.error("❌ DATABASE_URL not configured")
         logger.warning("⚠️ Server starting WITHOUT database connection")
         db_pool = None
+        admin_pool = None
     else:
         try:
             parsed = urlparse(database_url)
             
             logger.info(f"🔌 Connecting to database: {parsed.hostname}:{parsed.port}")
             
+            # ===== SINGLE POOL: NO CACHE - TRANSACTION POOLER COMPATIBLE =====
+            logger.info("📊 Initializing database connection pool (NO statement cache)...")
             db_pool = await asyncpg.create_pool(
                 user=parsed.username,
                 password=parsed.password,
@@ -119,17 +123,23 @@ async def startup():
                 host=parsed.hostname,
                 port=parsed.port or 5432,
                 ssl='require',
-                min_size=2,
-                max_size=10,
-                timeout=10
+                min_size=3,
+                max_size=15,
+                timeout=10,
+                statement_cache_size=0,  # NO CACHE - Required for Supabase Transaction Pooler
+                command_timeout=60
             )
             
-            # Test the connection
+            # Test connection
             async with db_pool.acquire() as conn:
                 result = await conn.fetchval('SELECT 1')
-                logger.info(f"✅ Database connection tested: {result}")
+                logger.info(f"✅ Database pool tested: {result}")
             
-            logger.info("✅ Database pool initialized")
+            logger.info("✅ Database pool initialized (statement_cache_size=0)")
+            
+            # Use same pool for admin operations
+            admin_pool = db_pool
+            logger.info("✅ Admin metrics pool: Using main pool (NO cache)")
             
             # Initialize performance logger
             performance_logger = PerformanceLogger(db_pool)
@@ -139,6 +149,7 @@ async def startup():
             logger.error(f"❌ Failed to initialize database: {e}")
             logger.warning("⚠️ Server starting WITHOUT database connection")
             db_pool = None
+            admin_pool = None
             performance_logger = None
     
     # Initialize translation service (independent of database)
@@ -151,8 +162,9 @@ async def startup():
     
     logger.info("=" * 60)
     logger.info("✅ MCP Server Ready!")
-    logger.info(f"   - Database: {'Connected' if db_pool else 'Disconnected'}")
-    logger.info(f"   - Translation: {'Enabled' if translation_service else 'Disabled'}")
+    logger.info(f"   - Database Pool: {'Connected (statement_cache_size=0)' if db_pool else 'Disconnected'}")
+    logger.info(f"   - Transaction Pooler Compatible: YES")
+    logger.info(f"   - Translation: {'Disabled (using stubs)' if translation_service else 'Disabled'}")
     logger.info(f"   - Performance Logging: {'Enabled' if performance_logger else 'Disabled'}")
     logger.info("=" * 60)
 
@@ -160,11 +172,13 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     """Cleanup on shutdown"""
-    global db_pool
+    global db_pool, admin_pool
     
     if db_pool:
         await db_pool.close()
         logger.info("Database pool closed")
+    
+    # admin_pool points to same pool, no need to close twice
 
 
 # ============================================
@@ -176,9 +190,12 @@ async def root():
     """Root endpoint"""
     return {
         "service": "Mali Daftari MCP Server",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "features": {
+            "single_reliable_pool": True,
+            "statement_cache_disabled": True,
+            "transaction_pooler_compatible": True,
             "translation": translation_service is not None,
             "monitoring": performance_logger is not None,
             "real_time_admin": True
@@ -189,13 +206,13 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check"""
-    db_status = "connected" if db_pool else "disconnected"
-    translation_status = "enabled" if translation_service else "disabled"
+    pool_status = "connected" if db_pool else "disconnected"
+    translation_status = "disabled" if translation_service else "disabled"
     
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "database": db_status,
+        "database_pool": pool_status,
         "translation": translation_status,
         "admin_connections": len(admin_connections)
     }
@@ -207,14 +224,17 @@ async def test_endpoint():
     return {
         "message": "MCP server is running!",
         "timestamp": datetime.utcnow().isoformat(),
-        "database_connected": db_pool is not None,
+        "pool_connected": db_pool is not None,
         "translation_enabled": translation_service is not None
     }
 
 
 @app.post("/query")
 async def execute_query(request: QueryRequest):
-    """Execute SQL query with monitoring"""
+    """
+    Execute SQL query with monitoring
+    USES SINGLE POOL (NO CACHE) for reliability
+    """
     
     if not db_pool:
         raise HTTPException(status_code=500, detail="Database not initialized")
@@ -230,7 +250,7 @@ async def execute_query(request: QueryRequest):
     try:
         logger.info(f"Executing query: {request.sql[:100]}...")
         
-        # Execute query using the pool
+        # Execute query using reliable pool
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(request.sql)
             result = [dict(row) for row in rows]
@@ -272,7 +292,7 @@ async def execute_query(request: QueryRequest):
 async def log_interaction(request: LogInteractionRequest):
     """
     Log AI agent interaction for monitoring and analytics
-    This is called by the backend after each user interaction
+    USES SINGLE POOL (NO CACHE) for reliability
     """
     
     if not db_pool:
@@ -344,12 +364,12 @@ async def log_interaction(request: LogInteractionRequest):
 
 
 # ============================================
-# TRANSLATION ENDPOINTS
+# TRANSLATION ENDPOINTS (Stubs)
 # ============================================
 
 @app.post("/translate")
 async def translate_text(request: TranslateRequest):
-    """Translate text between languages"""
+    """Translate text between languages (stub)"""
     
     if not translation_service:
         raise HTTPException(status_code=503, detail="Translation service not available")
@@ -378,7 +398,7 @@ async def translate_text(request: TranslateRequest):
 
 @app.post("/detect-language")
 async def detect_language(request: DetectLanguageRequest):
-    """Detect language of text"""
+    """Detect language of text (stub)"""
     
     if not translation_service:
         raise HTTPException(status_code=503, detail="Translation service not available")
@@ -403,9 +423,12 @@ async def detect_language(request: DetectLanguageRequest):
 
 @app.get("/admin/metrics/live")
 async def get_live_metrics():
-    """Get real-time metrics for admin panel (HTTP polling version)"""
+    """
+    Get real-time metrics for admin panel (HTTP polling version)
+    USES SINGLE POOL (NO CACHE) for reliability
+    """
     
-    if not db_pool:
+    if not admin_pool:
         return {
             "status": "database_unavailable",
             "timestamp": datetime.utcnow().isoformat(),
@@ -415,7 +438,7 @@ async def get_live_metrics():
         }
     
     try:
-        async with db_pool.acquire() as conn:
+        async with admin_pool.acquire() as conn:
             # Today's stats
             today_stats = await conn.fetchrow("""
                 SELECT 
@@ -487,7 +510,7 @@ async def admin_websocket(websocket: WebSocket):
     
     try:
         # Send initial metrics
-        if db_pool:
+        if admin_pool:
             metrics = await get_realtime_metrics()
             await websocket.send_json({
                 "type": "initial_metrics",
@@ -504,7 +527,7 @@ async def admin_websocket(websocket: WebSocket):
                     await websocket.send_json({"type": "pong"})
                 
                 elif data.get("type") == "request_metrics":
-                    if db_pool:
+                    if admin_pool:
                         metrics = await get_realtime_metrics()
                         await websocket.send_json({
                             "type": "metrics_update",
@@ -542,9 +565,12 @@ async def broadcast_to_admins(message: dict):
 
 
 async def get_realtime_metrics() -> dict:
-    """Get real-time metrics for admin panel"""
+    """
+    Get real-time metrics for admin panel
+    USES SINGLE POOL (NO CACHE) for reliability
+    """
     
-    if not db_pool:
+    if not admin_pool:
         return {
             "status": "database_unavailable",
             "today": {},
@@ -553,7 +579,7 @@ async def get_realtime_metrics() -> dict:
         }
     
     try:
-        async with db_pool.acquire() as conn:
+        async with admin_pool.acquire() as conn:
             # Today's stats
             today_stats = await conn.fetchrow("""
                 SELECT 

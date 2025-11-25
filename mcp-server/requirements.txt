@@ -6,11 +6,12 @@ httpx==0.27.0           # Used by MCPClient
 pydantic==2.6.4         # Ensures compatibility with FastAPI newer versions
 # Existing dependencies
 
-#Translation & NLP dependencies
-transformers==4.36.0
-torch==2.1.0
-sentencepiece==0.1.99
-protobuf==4.25.1
+
+# Translation dependencies - DISABLED FOR NOW
+# transformers==4.36.0
+# torch==2.1.0
+# sentencepiece==0.1.99
+# protobuf==4.25.1
 # Utilities
 
 # Anthropic (for advanced processing)
