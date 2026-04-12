@@ -34,9 +34,8 @@ services:
       - "8000:8000"
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - USE_ANTHROPIC=true
-      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}
-      - DATABASE_URL=${DATABASE_URL}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - MCP_SERVER_URL=http://mcp-postgres:8000
       - LOG_LEVEL=INFO
       - ENVIRONMENT=production

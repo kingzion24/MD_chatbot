@@ -17,6 +17,7 @@ import time
 import uuid
 
 from config import Config
+from utils.greetings import get_time_aware_greeting
 from utils.sql_validator import validate_query_complete
 from utils.mcp_client import MCPClient
 from prompts.system_prompt import get_system_prompt
@@ -48,9 +49,6 @@ try:
 except ValueError as e:
     logger.error(f"❌ Configuration error: {str(e)}")
     raise
-
-# JWT secret for Supabase token verification
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 
 # Initialize clients
 config = Config()
@@ -468,7 +466,7 @@ async def chat_websocket(websocket: WebSocket):
         try:
             claims = jwt.decode(
                 token,
-                SUPABASE_JWT_SECRET,
+                config.SUPABASE_JWT_SECRET,
                 algorithms=["HS256"],
                 audience="authenticated",
             )
@@ -497,11 +495,29 @@ async def chat_websocket(websocket: WebSocket):
             f"business={business_id[:8]}..., session={session_id[:8]}..."
         )
 
+        # ── Frame 1: instant connection acknowledgment ────────────────────────
         await websocket.send_json({
             "type": "connected",
-            "message": "Hello! I'm Karaba, your Mali Daftari assistant 💼 (Naweza kuongea Kiswahili na Kiingereza!)",
+            "message": "Connected successfully.",
             "session_id": session_id,
-            "supports_swahili": True,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
+
+        # ── Frame 2: personalised greeting ────────────────────────────────────
+        # Kick off the business-name DB lookup and the typing delay in parallel
+        # so the greeting arrives exactly 1.2 s after the connected frame
+        # regardless of how fast the database responds.
+        business_name_task = asyncio.create_task(
+            mcp_client.get_business_name(business_id)
+        )
+        await asyncio.sleep(1.2)
+        business_name = await business_name_task
+
+        greeting = get_time_aware_greeting(business_name)
+        await websocket.send_json({
+            "type": "greeting",
+            "content": greeting,
+            "language": "sw",
             "timestamp": datetime.utcnow().isoformat(),
         })
 

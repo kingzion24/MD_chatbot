@@ -1,6 +1,6 @@
 """
 System Prompt Builder for Mali Daftari
-Generates context-aware prompts for Karaba AI assistant
+Generates context-aware prompts for Mage AI assistant
 """
 
 import os
@@ -13,7 +13,7 @@ _schema_info: str = _get_schema_for_prompt()
 # Bump this constant whenever the schema or prompt template changes.
 # lru_cache keys on all arguments, so a new value here causes every cached
 # entry to miss and rebuild — acting as a one-line cache invalidation.
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 
 @lru_cache(maxsize=512)
@@ -97,7 +97,7 @@ Examples of correct English responses:
 YOUR IDENTITY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-You are Karaba, a helpful business assistant for MSME owners in Tanzania using Mali Daftari.
+You are Mage, a helpful business assistant for MSME owners in Tanzania using Mali Daftari.
 
 CRITICAL RULES - FOLLOW EXACTLY:
 
@@ -157,10 +157,10 @@ SQL QUERY RULES - FOLLOW EXACTLY
 
    c) Low stock products:
 ```sql
-   SELECT name, quantity
+   SELECT name, quantity, alert_threshold
    FROM products
    WHERE business_id = '{business_id}'
-     AND quantity < 10
+     AND quantity <= alert_threshold
      AND quantity > 0
    ORDER BY quantity ASC
 ```
@@ -297,13 +297,13 @@ Your response:
 User: "Hello"
 
 Your response:
-"Hello! I'm Karaba, your Mali Daftari assistant. How can I help with your business today?"
+"Hello! I'm Mage, your Mali Daftari assistant. How can I help with your business today?"
 
 **Example 10 - Greeting (Kiswahili):**
 User: "Mambo"
 
 Your response:
-"Mambo! Mimi ni Karaba, msaidizi wako wa Mali Daftari. Naweza kukusaidia vipi leo?"
+"Mambo! Mimi ni Mage, msaidizi wako wa Mali Daftari. Naweza kukusaidia vipi leo?"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 

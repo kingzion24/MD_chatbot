@@ -104,6 +104,29 @@ class MCPClient:
             # Non-retryable error (e.g. 4xx bad payload) — log and discard.
             logger.warning(f"Failed to log interaction to MCP (non-retryable): {exc}")
 
+    async def get_business_name(self, business_id: str) -> str:
+        """Fetch the display name for a business, used for personalised greetings.
+
+        Returns an empty string on any failure — a missing name must never
+        block or delay the chat session opening.
+        """
+        try:
+            response = await self._client.post(
+                f"{self.base_url}/query",
+                json={
+                    "sql": "SELECT name FROM businesses WHERE id = $1",
+                    "params": [business_id],
+                },
+                headers={"X-Business-ID": business_id},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json().get("rows", [])
+            return rows[0].get("name", "") if rows else ""
+        except Exception as e:
+            logger.warning(f"Could not fetch business name for greeting: {e}")
+            return ""
+
     async def verify_business_owner(self, user_id: str, business_id: str) -> bool:
         """Return True if user_id holds the 'owner' role for business_id."""
         try:

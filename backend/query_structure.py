@@ -15,18 +15,18 @@ DATABASE_SCHEMA = {
             "description": "Stock/inventory batches - groups of products purchased together",
             "primary_key": "id",
             "columns": {
-                "id": {"type": "UUID", "nullable": False},
-                "business_id": {"type": "UUID", "nullable": False, "indexed": True,
+                "id": {"type": "uuid", "nullable": False},
+                "business_id": {"type": "uuid", "nullable": False, "indexed": True,
                                "note": "CRITICAL: ALWAYS filter by this"},
-                "name": {"type": "VARCHAR(100)", "nullable": False,
+                "name": {"type": "varchar", "nullable": False,
                         "example": "January Stock, Supplier ABC Delivery"},
-                "rough_cost": {"type": "DECIMAL(12,2)", "nullable": False,
+                "rough_cost": {"type": "numeric", "nullable": False,
                               "description": "Estimated total cost of inventory batch"},
-                "status": {"type": "ENUM", "values": ["new", "in_progress", "completed"],
+                "status": {"type": "varchar", "values": ["new", "in_progress", "completed"],
                           "default": "new"},
-                "created_by": {"type": "UUID", "nullable": False},
-                "created_at": {"type": "TIMESTAMP WITH TIME ZONE"},
-                "updated_at": {"type": "TIMESTAMP WITH TIME ZONE"}
+                "created_by": {"type": "uuid", "nullable": False},
+                "created_at": {"type": "timestamptz"},
+                "updated_at": {"type": "timestamptz"}
             },
             "relationships": {
                 "has_many": ["products"],
@@ -43,19 +43,25 @@ DATABASE_SCHEMA = {
             "description": "Individual products within inventory batches",
             "primary_key": "id",
             "columns": {
-                "id": {"type": "UUID"},
-                "business_id": {"type": "UUID", "indexed": True,
+                "id": {"type": "uuid"},
+                "business_id": {"type": "uuid", "indexed": True,
                                "note": "CRITICAL: ALWAYS filter by this"},
-                "inventory_id": {"type": "UUID", "description": "Parent inventory batch"},
-                "name": {"type": "VARCHAR(200)", "example": "Nike Shoes Size 42"},
-                "quantity": {"type": "INTEGER", "default": 0,
-                            "description": "CURRENT stock (auto-updated by system when sales happen)",
+                "inventory_id": {"type": "uuid", "description": "Parent inventory batch"},
+                "name": {"type": "varchar", "example": "Nike Shoes Size 42"},
+                "quantity": {"type": "int4", "default": 0,
+                            "description": "CURRENT shop stock (auto-updated by system when sales happen)",
                             "important": "This decreases when products are sold"},
-                "initial_quantity": {"type": "INTEGER", "default": 0,
+                "initial_quantity": {"type": "int4", "default": 0,
                                    "description": "STARTING stock (user sets, NEVER changes)",
                                    "important": "Use this to calculate sold: initial_quantity - quantity"},
-                "created_at": {"type": "TIMESTAMP"},
-                "updated_at": {"type": "TIMESTAMP"}
+                "warehouse_quantity": {"type": "int4", "default": 0,
+                                      "description": "Stock held in warehouse (not yet in shop)"},
+                "shop_quantity": {"type": "int4", "default": 0,
+                                 "description": "Stock currently on shop floor (mirrors quantity)"},
+                "alert_threshold": {"type": "int4", "default": 5,
+                                   "description": "Low-stock alert level set per product; use this instead of hardcoded values"},
+                "created_at": {"type": "timestamptz"},
+                "updated_at": {"type": "timestamptz"}
             },
             "calculated_fields": {
                 "sold_quantity": {
@@ -74,7 +80,7 @@ DATABASE_SCHEMA = {
                 "has_many": ["sales"]
             },
             "common_queries": [
-                "Low stock: WHERE quantity < 10 AND quantity > 0",
+                "Low stock: WHERE quantity <= alert_threshold AND quantity > 0",
                 "Out of stock: WHERE quantity = 0",
                 "Total sold: SUM(initial_quantity - quantity)",
                 "Products by inventory: JOIN inventories..."
@@ -85,18 +91,18 @@ DATABASE_SCHEMA = {
             "description": "Individual sales transactions",
             "primary_key": "id",
             "columns": {
-                "id": {"type": "UUID"},
-                "business_id": {"type": "UUID", "indexed": True,
+                "id": {"type": "uuid"},
+                "business_id": {"type": "uuid", "indexed": True,
                                "note": "CRITICAL: ALWAYS filter by this"},
-                "product_id": {"type": "UUID", "indexed": True},
-                "quantity": {"type": "INTEGER", "description": "Units sold in this transaction"},
-                "price": {"type": "DECIMAL(12,2)", "description": "Price PER UNIT (not total)"},
-                "total_amount": {"type": "DECIMAL(12,2)", "computed": True,
+                "product_id": {"type": "uuid", "indexed": True},
+                "quantity": {"type": "int4", "description": "Units sold in this transaction"},
+                "price": {"type": "numeric", "description": "Price PER UNIT (not total)"},
+                "total_amount": {"type": "numeric", "computed": True,
                                 "formula": "quantity * price",
                                 "description": "Auto-calculated total"},
-                "created_by": {"type": "UUID"},
-                "created_at": {"type": "TIMESTAMP", "description": "System timestamp"},
-                "sale_date": {"type": "DATE", "indexed": True,
+                "created_by": {"type": "uuid"},
+                "created_at": {"type": "timestamptz", "description": "System timestamp"},
+                "sale_date": {"type": "date", "indexed": True,
                              "description": "Actual sale date - USE THIS for date filtering!"}
             },
             "aggregations": {
@@ -122,15 +128,15 @@ DATABASE_SCHEMA = {
             "description": "Business expenses and costs",
             "primary_key": "id",
             "columns": {
-                "id": {"type": "UUID"},
-                "business_id": {"type": "UUID", "indexed": True,
+                "id": {"type": "uuid"},
+                "business_id": {"type": "uuid", "indexed": True,
                                "note": "CRITICAL: ALWAYS filter by this"},
-                "name": {"type": "VARCHAR(200)", "example": "Rent, Electricity, Transport"},
-                "amount": {"type": "DECIMAL(12,2)"},
-                "receipt_url": {"type": "TEXT", "nullable": True},
-                "created_by": {"type": "UUID"},
-                "created_at": {"type": "TIMESTAMP"},
-                "expense_date": {"type": "DATE", "indexed": True,
+                "name": {"type": "varchar", "example": "Rent, Electricity, Transport"},
+                "amount": {"type": "numeric"},
+                "receipt_url": {"type": "text", "nullable": True},
+                "created_by": {"type": "uuid"},
+                "created_at": {"type": "timestamptz"},
+                "expense_date": {"type": "date", "indexed": True,
                                 "description": "Actual expense date - USE THIS for filtering!"}
             },
             "aggregations": {
@@ -180,7 +186,7 @@ DATABASE_SCHEMA = {
         {
             "natural_language": "Show me products with low stock",
             "swahili": "Nionyeshe bidhaa ambazo hifadhi ni kidogo",
-            "sql": "SELECT * FROM products WHERE business_id = '{business_id}' AND quantity < 10 AND quantity > 0 ORDER BY quantity ASC"
+            "sql": "SELECT name, quantity, alert_threshold FROM products WHERE business_id = '{business_id}' AND quantity <= alert_threshold AND quantity > 0 ORDER BY quantity ASC"
         },
         {
             "natural_language": "What are my best selling products?",

@@ -3,6 +3,12 @@ Mali Daftari MCP Server
 Simplified with single connection pool for optimal reliability
 """
 
+from dotenv import load_dotenv, find_dotenv
+
+# Walk up to find the root .env — no-op in Docker (env already injected by
+# docker-compose), but populates os.environ for local dev without containers.
+load_dotenv(find_dotenv())
+
 from fastapi import FastAPI, HTTPException, Request
 
 from slowapi import Limiter, _rate_limit_exceeded_handler
