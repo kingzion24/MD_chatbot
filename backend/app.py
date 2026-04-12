@@ -495,10 +495,9 @@ async def chat_websocket(websocket: WebSocket):
             f"business={business_id[:8]}..., session={session_id[:8]}..."
         )
 
-        # ── Frame 1: instant connection acknowledgment ────────────────────────
+        # ── Frame 1: silent session handshake (not shown to user) ───────────
         await websocket.send_json({
             "type": "connected",
-            "message": "Connected successfully.",
             "session_id": session_id,
             "timestamp": datetime.utcnow().isoformat(),
         })
