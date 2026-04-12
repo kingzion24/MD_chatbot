@@ -98,17 +98,18 @@ class QueryRouter:
             ]
         }
         
-        # Patterns that DEFINITELY indicate data queries
+        # Patterns that DEFINITELY indicate data queries.
+        # Compiled once at construction time — re-used on every is_data_query() call.
         self.data_patterns = [
-            r'\bmy\s+(sales|products|inventory|expenses|stock)\b',
-            r'\bthis\s+(month|week|year|quarter)\b',
-            r'\blast\s+\d+\s+(days|weeks|months)\b',
-            r'\bhow\s+many\b',
-            r'\bhow\s+much\b',
-            r'\btotal\s+(sales|revenue|expenses)\b',
-            r'\bmauzo\s+yangu\b',
-            r'\bmwezi\s+huu\b',
-            r'\bwiki\s+hii\b',
+            re.compile(r'\bmy\s+(sales|products|inventory|expenses|stock)\b'),
+            re.compile(r'\bthis\s+(month|week|year|quarter)\b'),
+            re.compile(r'\blast\s+\d+\s+(days|weeks|months)\b'),
+            re.compile(r'\bhow\s+many\b'),
+            re.compile(r'\bhow\s+much\b'),
+            re.compile(r'\btotal\s+(sales|revenue|expenses)\b'),
+            re.compile(r'\bmauzo\s+yangu\b'),
+            re.compile(r'\bmwezi\s+huu\b'),
+            re.compile(r'\bwiki\s+hii\b'),
         ]
     
     def is_data_query(self, query: str, language: Literal["sw", "en"]) -> bool:
@@ -124,9 +125,9 @@ class QueryRouter:
         """
         query_lower = query.lower()
         
-        # FIRST: Check definite data patterns
+        # FIRST: Check definite data patterns (pre-compiled in __init__)
         for pattern in self.data_patterns:
-            if re.search(pattern, query_lower):
+            if pattern.search(query_lower):
                 logger.info(f"📊 DEFINITE data query matched pattern: {pattern}")
                 return True
         

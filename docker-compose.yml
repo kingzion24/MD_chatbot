@@ -43,8 +43,6 @@ services:
     dns:                    
       - 8.8.8.8            
       - 8.8.4.4            
-    volumes:
-      - translation-models-cache:/root/.cache/huggingface
     depends_on:
       mcp-postgres:
         condition: service_healthy
@@ -61,7 +59,3 @@ services:
 networks:
   msme-network:
     driver: bridge
-
-volumes:
-  translation-models-cache:
-    driver: local

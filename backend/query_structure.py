@@ -9,14 +9,14 @@ import json
 DATABASE_SCHEMA = {
     "database": "mali_daftari",
     "description": "Multi-tenant business management system for MSMEs in Tanzania",
-    
+
     "tables": {
         "inventories": {
             "description": "Stock/inventory batches - groups of products purchased together",
             "primary_key": "id",
             "columns": {
                 "id": {"type": "UUID", "nullable": False},
-                "business_id": {"type": "UUID", "nullable": False, "indexed": True, 
+                "business_id": {"type": "UUID", "nullable": False, "indexed": True,
                                "note": "CRITICAL: ALWAYS filter by this"},
                 "name": {"type": "VARCHAR(100)", "nullable": False,
                         "example": "January Stock, Supplier ABC Delivery"},
@@ -38,7 +38,7 @@ DATABASE_SCHEMA = {
                 "Calculate total inventory cost: SUM(rough_cost)"
             ]
         },
-        
+
         "products": {
             "description": "Individual products within inventory batches",
             "primary_key": "id",
@@ -80,7 +80,7 @@ DATABASE_SCHEMA = {
                 "Products by inventory: JOIN inventories..."
             ]
         },
-        
+
         "sales": {
             "description": "Individual sales transactions",
             "primary_key": "id",
@@ -117,7 +117,7 @@ DATABASE_SCHEMA = {
                 "last_30_days": "WHERE sale_date >= CURRENT_DATE - INTERVAL '30 days'"
             }
         },
-        
+
         "expenses": {
             "description": "Business expenses and costs",
             "primary_key": "id",
@@ -146,16 +146,16 @@ DATABASE_SCHEMA = {
             ]
         }
     },
-    
+
     "business_calculations": {
         "profit": {
             "description": "Total revenue minus total expenses",
             "formula": "SUM(sales.total_amount) - SUM(expenses.amount)",
             "sql_template": """
-                SELECT 
-                    (SELECT COALESCE(SUM(total_amount), 0) FROM sales 
+                SELECT
+                    (SELECT COALESCE(SUM(total_amount), 0) FROM sales
                      WHERE business_id = '{business_id}' {date_filter}) -
-                    (SELECT COALESCE(SUM(amount), 0) FROM expenses 
+                    (SELECT COALESCE(SUM(amount), 0) FROM expenses
                      WHERE business_id = '{business_id}' {date_filter}) as profit
             """
         },
@@ -165,7 +165,7 @@ DATABASE_SCHEMA = {
             "sql_template": "SELECT SUM(total_amount) as revenue FROM sales WHERE business_id = '{business_id}' {date_filter}"
         }
     },
-    
+
     "query_examples": [
         {
             "natural_language": "Show me sales from today",
@@ -194,7 +194,7 @@ DATABASE_SCHEMA = {
                       LIMIT 10"""
         }
     ],
-    
+
     "sql_rules": {
         "MANDATORY": [
             "ALWAYS include: WHERE business_id = '{business_id}'",
@@ -215,7 +215,7 @@ DATABASE_SCHEMA = {
             "Don't forget COALESCE for aggregates that might be NULL"
         ]
     },
-    
+
     "swahili_to_english_terms": {
         "mauzo": "sales",
         "bidhaa": "products",
@@ -233,11 +233,6 @@ DATABASE_SCHEMA = {
 }
 
 
-def get_schema_json():
-    """Return schema as formatted JSON string"""
-    return json.dumps(DATABASE_SCHEMA, indent=2)
-
-
 def get_schema_for_prompt():
     """Return schema formatted for system prompt"""
     return f"""
@@ -251,8 +246,3 @@ KEY POINTS:
 4. Sold quantity = initial_quantity - quantity
 5. Use COALESCE for aggregates to handle NULL
 """
-
-
-# Example usage
-if __name__ == "__main__":
-    print(get_schema_for_prompt())

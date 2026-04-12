@@ -4,8 +4,10 @@ Uses Claude's native multilingual capabilities for bilingual support
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+
+import asyncio
 import json
+import jwt
 import os
 from datetime import datetime
 from anthropic import AsyncAnthropic
@@ -39,16 +41,6 @@ app = FastAPI(
     description="AI-powered bilingual business assistant for MSME owners (using Claude's native multilingual capabilities)"
 )
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
 # Validate config on startup
 try:
     Config.validate()
@@ -56,6 +48,9 @@ try:
 except ValueError as e:
     logger.error(f"❌ Configuration error: {str(e)}")
     raise
+
+# JWT secret for Supabase token verification
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 
 # Initialize clients
 config = Config()
@@ -156,34 +151,41 @@ def detect_language(text: str) -> Literal["sw", "en"]:
 async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
     """Execute SQL query via MCP server with security validation"""
     try:
-        # Validate and secure the query
-        secured_query = validate_query_complete(sql_query, business_id)
-        
-        if not secured_query:
-            logger.warning(f"⚠️ Invalid SQL query rejected: {sql_query[:50]}...")
-            return {
-                "success": False,
-                "error": "Invalid SQL query - security validation failed",
-                "results": [],
-                "row_count": 0
-            }
-        
+        # Validate and secure the query — raises ValueError if rejected.
+        # business_id is NOT passed to the validator; instead the validator
+        # injects the $1 placeholder and the value is bound here as a parameter.
+        secured_query = validate_query_complete(sql_query)
+
         logger.info(f"🔍 Executing secured query for business {business_id[:8]}...")
         logger.debug(f"SQL: {secured_query}")
-        
-        # Execute via MCP
-        result = await mcp_client.execute_query(secured_query)
-        
+
+        # Execute via MCP — business_id is bound as the first positional
+        # parameter ($1) by asyncpg, never interpolated into the SQL string.
+        # It is also forwarded in the X-Business-ID header so the MCP server's
+        # rate limiter applies a per-tenant quota rather than a shared one.
+        result = await mcp_client.execute_query(
+            secured_query, params=[business_id], business_id=business_id
+        )
+
         row_count = len(result.get('rows', []))
         logger.info(f"✅ Query returned {row_count} rows")
-        
+
         return {
             "success": True,
             "results": result.get('rows', []),
             "row_count": row_count,
             "columns": result.get('columns', [])
         }
-        
+
+    except ValueError as exc:
+        logger.warning(f"⚠️ Invalid SQL query rejected: {exc}")
+        return {
+            "success": False,
+            "error": "Invalid SQL query - security validation failed",
+            "results": [],
+            "row_count": 0
+        }
+
     except Exception as e:
         logger.error(f"❌ MCP execution error: {str(e)}")
         return {
@@ -194,11 +196,11 @@ async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
         }
 
 
-async def log_interaction_to_mcp(
+async def log_interaction(
     business_id: str,
     session_id: str,
     original_query: str,
-    detected_language: str,
+    language: str,
     query_type: str,
     generated_sql: str,
     query_success: bool,
@@ -206,268 +208,334 @@ async def log_interaction_to_mcp(
     processing_time_ms: int,
     error_message: str = None
 ):
-    """Log interaction to MCP server for admin monitoring"""
+    """Log interaction to MCP server for admin monitoring.
+
+    Runs as a fire-and-forget background task via asyncio.create_task(), so
+    exceptions must be caught here — an unhandled exception in a Task silently
+    drops the result and can log spurious 'Task exception was never retrieved'
+    warnings to the event loop.
+    """
     try:
-        import httpx
-        
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{config.MCP_SERVER_URL}/log-interaction",
-                json={
-                    "business_id": business_id,
-                    "session_id": session_id,
-                    "original_query": original_query,
-                    "detected_language": detected_language,
-                    "translated_query": None,  # No translation needed - Claude speaks both languages
-                    "query_type": query_type,
-                    "generated_sql": generated_sql,
-                    "query_success": query_success,
-                    "response_text": response_text,
-                    "response_language": detected_language,
-                    "total_processing_time_ms": processing_time_ms,
-                    "error_message": error_message
-                },
-                timeout=5.0
-            )
-            logger.debug(f"📝 Interaction logged to MCP server")
+        await mcp_client.log_interaction({
+            "business_id": business_id,
+            "session_id": session_id,
+            "original_query": original_query,
+            "detected_language": language,
+            "query_type": query_type,
+            "generated_sql": generated_sql,
+            "query_success": query_success,
+            "response_text": response_text,
+            "response_language": language,
+            "total_processing_time_ms": processing_time_ms,
+            "error_message": error_message
+        })
+        logger.debug("📝 Interaction logged to MCP server")
     except Exception as e:
-        logger.warning(f"⚠️ Failed to log interaction to MCP: {e}")
+        logger.warning(f"Background logging failed: {e}")
+
+
+def classify_query_intent(message: str, language: str) -> tuple[bool, str]:
+    """Route a message to either the data or conversational pipeline.
+
+    Returns:
+        (is_data_query, query_type)
+    """
+    is_data_query = query_router.is_data_query(message, language)
+    query_type = "data_query" if is_data_query else "conversational"
+    if is_data_query:
+        logger.info("📊 Classified as DATA QUERY - will use database if needed")
+    else:
+        logger.info("💬 Classified as CONVERSATIONAL - general advice")
+    return is_data_query, query_type
+
+
+async def handle_conversational_query(message: str, business_id: str, language: str) -> str:
+    """Call Claude without tools for a general/advice response.
+
+    Returns:
+        Natural language response text.
+    """
+    response = await anthropic_client.messages.create(
+        model=config.ANTHROPIC_MODEL,
+        max_tokens=4096,
+        system=get_system_prompt(language=language, business_id=business_id),
+        messages=[{"role": "user", "content": message}],
+        tools=[],
+    )
+    return next(
+        (block.text for block in response.content if hasattr(block, "text")),
+        "I couldn't generate a response."
+    )
+
+
+async def generate_sql_with_llm(message: str, business_id: str, language: str) -> tuple:
+    """First Claude call for data queries: let Claude decide if it needs to query the DB.
+
+    Returns:
+        (response, tool_use_block, generated_sql)
+        tool_use_block and generated_sql are None if Claude answered directly.
+    """
+    response = await anthropic_client.messages.create(
+        model=config.ANTHROPIC_MODEL,
+        max_tokens=4096,
+        system=get_system_prompt(language=language, business_id=business_id),
+        messages=[{"role": "user", "content": message}],
+        tools=MCP_TOOLS,
+    )
+    logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
+
+    if response.stop_reason != "tool_use":
+        return response, None, None
+
+    tool_use = next(block for block in response.content if block.type == "tool_use")
+    generated_sql = tool_use.input.get("query", "")
+    logger.info(f"🔧 Tool requested: {tool_use.name}")
+    if "explanation" in tool_use.input:
+        logger.info(f"📝 Query explanation: {tool_use.input['explanation']}")
+
+    return response, tool_use, generated_sql
+
+
+async def execute_business_query(sql_query: str, business_id: str) -> tuple[Dict, bool, str]:
+    """Validate and run a SQL query via the MCP client.
+
+    Returns:
+        (tool_result, success, error_message)
+        Never raises — surfaces errors as data so the orchestrator can continue.
+    """
+    tool_result = await execute_mcp_tool(sql_query, business_id)
+    success = tool_result.get("success", False)
+    error_message = None
+
+    if not success:
+        error_message = tool_result.get("error", "Unknown error")
+        logger.warning(f"⚠️ Query failed: {error_message}")
+    else:
+        logger.info(f"✅ Query successful: {tool_result.get('row_count', 0)} rows")
+
+    return tool_result, success, error_message
+
+
+async def format_data_response(
+    message: str,
+    business_id: str,
+    language: str,
+    first_response,
+    tool_use,
+    tool_result: Dict,
+) -> str:
+    """Second Claude call: turn raw DB rows into a natural language answer.
+
+    Returns:
+        Formatted response text in the user's language.
+    """
+    final_response = await anthropic_client.messages.create(
+        model=config.ANTHROPIC_MODEL,
+        max_tokens=4096,
+        system=get_system_prompt(language=language, business_id=business_id),
+        messages=[
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": first_response.content},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": json.dumps(tool_result),
+                    }
+                ],
+            },
+        ],
+        tools=MCP_TOOLS,
+    )
+    return next(
+        (block.text for block in final_response.content if hasattr(block, "text")),
+        "I couldn't generate a response."
+    )
 
 
 async def process_message(
-    message: str, 
-    business_id: str, 
+    message: str,
+    business_id: str,
     user_id: str,
-    session_id: str
+    session_id: str,
 ) -> tuple[str, str]:
-    """
-    Process user message using Claude's native multilingual capabilities
-    Claude responds in the same language as the user's input
-    
+    """High-level orchestrator: detect → route → query → format → log.
+
     Returns:
         (response_text, detected_language)
     """
-    
     start_time = time.time()
-    original_query = message
-    query_type = "conversational"
     generated_sql = None
+    query_type = "conversational"
     query_success = False
     error_message = None
-    
+
     try:
         logger.info(f"💬 Processing message from user {user_id[:8]}...: {message[:50]}...")
-        
-        # STEP 1: Detect language (simple keyword matching)
-        detected_language = detect_language(message)
-        logger.info(f"🌍 Detected language: {detected_language.upper()}")
-        
-        # STEP 2: Check if this is a data query or conversational query
-        is_data_query = query_router.is_data_query(message, detected_language)
-        query_type = "data_query" if is_data_query else "conversational"
-        
+
+        language = detect_language(message)
+        logger.info(f"🌍 Detected language: {language.upper()}")
+
+        is_data_query, query_type = classify_query_intent(message, language)
+
         if is_data_query:
-            logger.info("📊 Classified as DATA QUERY - will use database if needed")
-        else:
-            logger.info("💬 Classified as CONVERSATIONAL - general advice")
-        
-        # STEP 3: Send to Claude with language-specific prompt
-        # Claude will automatically respond in the detected language
-        response = await anthropic_client.messages.create(
-            model=config.ANTHROPIC_MODEL,
-            max_tokens=4096,
-            system=get_system_prompt(business_id, detected_language),
-            messages=[
-                {"role": "user", "content": message}  # Original message - no translation!
-            ],
-            tools=MCP_TOOLS if is_data_query else [],
-        )
-        
-        logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
-        
-        # STEP 4: Handle tool use (database queries)
-        if response.stop_reason == "tool_use":
-            tool_use = next(block for block in response.content if block.type == "tool_use")
-            tool_name = tool_use.name
-            tool_input = tool_use.input
-            
-            logger.info(f"🔧 Tool requested: {tool_name}")
-            generated_sql = tool_input.get('query', '')
-            
-            if 'explanation' in tool_input:
-                logger.info(f"📝 Query explanation: {tool_input['explanation']}")
-            
-            # Execute database query
-            tool_result = await execute_mcp_tool(
-                tool_input['query'],
-                business_id
+            first_response, tool_use, generated_sql = await generate_sql_with_llm(
+                message, business_id, language
             )
-            
-            query_success = tool_result.get('success', False)
-            
-            if not query_success:
-                error_message = tool_result.get('error', 'Unknown error')
-                logger.warning(f"⚠️ Query failed: {error_message}")
+            if tool_use is not None:
+                tool_result, query_success, error_message = await execute_business_query(
+                    generated_sql, business_id
+                )
+                response_text = await format_data_response(
+                    message, business_id, language, first_response, tool_use, tool_result
+                )
             else:
-                logger.info(f"✅ Query successful: {tool_result.get('row_count', 0)} rows")
-            
-            # Send tool result back to Claude for final response
-            final_response = await anthropic_client.messages.create(
-                model=config.ANTHROPIC_MODEL,
-                max_tokens=4096,
-                system=get_system_prompt(business_id, detected_language),
-                messages=[
-                    {"role": "user", "content": message},
-                    {"role": "assistant", "content": response.content},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.id,
-                                "content": json.dumps(tool_result),
-                            }
-                        ],
-                    }
-                ],
-                tools=MCP_TOOLS,
-            )
-            
-            text_content = next(
-                (block.text for block in final_response.content if hasattr(block, "text")),
-                "I couldn't generate a response."
-            )
+                query_success = True
+                response_text = next(
+                    (block.text for block in first_response.content if hasattr(block, "text")),
+                    "I couldn't generate a response."
+                )
         else:
-            # No tools needed - direct response
-            query_success = True  # Conversational queries are always "successful"
-            text_content = next(
-                (block.text for block in response.content if hasattr(block, "text")),
-                "I couldn't generate a response."
-            )
-        
-        # Claude responds in the detected language automatically - no translation needed!
-        final_response_text = text_content
-        
-        # Calculate processing time
+            query_success = True
+            response_text = await handle_conversational_query(message, business_id, language)
+
         processing_time_ms = int((time.time() - start_time) * 1000)
-        
-        logger.info(f"✅ Response in {detected_language.upper()}: {len(final_response_text)} chars in {processing_time_ms}ms")
-        
-        # STEP 5: Log interaction to MCP server for admin monitoring
-        await log_interaction_to_mcp(
+        logger.info(f"✅ Response in {language.upper()}: {len(response_text)} chars in {processing_time_ms}ms")
+
+        asyncio.create_task(log_interaction(
             business_id=business_id,
             session_id=session_id,
-            original_query=original_query,
-            detected_language=detected_language,
+            original_query=message,
+            language=language,
             query_type=query_type,
             generated_sql=generated_sql,
             query_success=query_success,
-            response_text=final_response_text,
+            response_text=response_text,
             processing_time_ms=processing_time_ms,
-            error_message=error_message
-        )
-        
-        return final_response_text, detected_language
-        
+        ))
+
+        return response_text, language
+
     except Exception as e:
         logger.error(f"❌ Error processing message: {str(e)}", exc_info=True)
-        
-        # Calculate processing time even for errors
         processing_time_ms = int((time.time() - start_time) * 1000)
-        error_message = str(e)
-        
-        # Detect language for error message
-        detected_language = detect_language(message)
-        
-        # Log failed interaction
-        await log_interaction_to_mcp(
+        language = detect_language(message)
+
+        asyncio.create_task(log_interaction(
             business_id=business_id,
             session_id=session_id,
-            original_query=original_query,
-            detected_language=detected_language,
+            original_query=message,
+            language=language,
             query_type=query_type,
             generated_sql=generated_sql,
             query_success=False,
             response_text="Error occurred",
             processing_time_ms=processing_time_ms,
-            error_message=error_message
+            error_message=str(e),
+        ))
+
+        error_msg = (
+            "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
+            if language == "sw"
+            else "I apologize, but I encountered an error. Please try again."
         )
-        
-        # Return error in user's language
-        if detected_language == "sw":
-            error_msg = "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
-        else:
-            error_msg = "I apologize, but I encountered an error. Please try again."
-        
-        return error_msg, detected_language
+        return error_msg, language
 
 
 @app.websocket("/ws/chat")
 async def chat_websocket(websocket: WebSocket):
-    """WebSocket endpoint for chat"""
+    """WebSocket endpoint for chat — requires JWT + owner verification on handshake."""
     await websocket.accept()
-    
-    business_id = None
+
     user_id = None
-    session_id = str(uuid.uuid4())  # Generate session ID
-    
+    business_id = None
+    session_id = None
+
     try:
-        # Initialize connection
+        # ── Phase 1: read handshake payload ──────────────────────────────────
         init_data = await websocket.receive_json()
-        business_id = init_data.get('business_id')
-        user_id = init_data.get('user_id')
-        
-        if not business_id or not user_id:
-            await websocket.send_json({
-                "type": "error",
-                "message": "business_id and user_id are required"
-            })
+        token = init_data.get("token")
+        business_id = init_data.get("business_id")
+
+        if not token or not business_id:
+            logger.warning("WebSocket rejected: missing token or business_id")
+            await websocket.close(code=1008)
             return
-        
-        logger.info(f"🔌 WebSocket connected: user={user_id[:8]}..., business={business_id[:8]}..., session={session_id[:8]}...")
-        
-        # Send welcome message
+
+        # ── Phase 2: decode & verify JWT ─────────────────────────────────────
+        try:
+            claims = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256"],
+                audience="authenticated",
+            )
+            user_id = claims.get("sub")
+            if not user_id:
+                raise jwt.InvalidTokenError("Missing 'sub' claim")
+        except jwt.PyJWTError as exc:
+            logger.warning(f"WebSocket rejected: invalid JWT — {exc}")
+            await websocket.close(code=1008)
+            return
+
+        # ── Phase 3: check business ownership ────────────────────────────────
+        is_owner = await mcp_client.verify_business_owner(user_id, business_id)
+        if not is_owner:
+            logger.warning(
+                f"WebSocket rejected: user={user_id[:8]}... is not owner of "
+                f"business={business_id[:8]}..."
+            )
+            await websocket.close(code=1008)
+            return
+
+        # ── Auth passed — start session ───────────────────────────────────────
+        session_id = str(uuid.uuid4())
+        logger.info(
+            f"🔌 WebSocket connected: user={user_id[:8]}..., "
+            f"business={business_id[:8]}..., session={session_id[:8]}..."
+        )
+
         await websocket.send_json({
             "type": "connected",
             "message": "Hello! I'm Karaba, your Mali Daftari assistant 💼 (Naweza kuongea Kiswahili na Kiingereza!)",
             "session_id": session_id,
             "supports_swahili": True,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
         })
-        
-        # Message loop
+
+        # ── Message loop ──────────────────────────────────────────────────────
         while True:
             data = await websocket.receive_json()
-            message = data.get('message', '').strip()
-            
+            message = data.get("message", "").strip()
+
             if not message:
                 continue
-            
+
             logger.info(f"📨 Message received: {message[:100]}...")
-            
-            # Process message - Claude responds in detected language
+
             response_text, detected_language = await process_message(
                 message, business_id, user_id, session_id
             )
-            
-            # Send response back to user
+
             await websocket.send_json({
                 "type": "message",
                 "content": response_text,
                 "language": detected_language,
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat(),
             })
-            
+
     except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}, session={session_id[:8]}")
+        logger.info(
+            f"🔌 WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}, "
+            f"session={session_id[:8] if session_id else 'none'}"
+        )
     except Exception as e:
         logger.error(f"❌ WebSocket error: {str(e)}", exc_info=True)
         try:
-            await websocket.send_json({
-                "type": "error",
-                "message": str(e)
-            })
-        except:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
             pass
 
 
@@ -522,6 +590,13 @@ async def root():
             "docs": "/docs"
         }
     }
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close the persistent MCP HTTP client on server shutdown"""
+    await mcp_client.close()
+    logger.info("✅ MCP client closed")
 
 
 if __name__ == "__main__":

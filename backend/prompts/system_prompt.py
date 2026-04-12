@@ -4,44 +4,54 @@ Generates context-aware prompts for Karaba AI assistant
 """
 
 import os
-import sys
+from functools import lru_cache
+
+from query_structure import get_schema_for_prompt as _get_schema_for_prompt
+
+_schema_info: str = _get_schema_for_prompt()
+
+# Bump this constant whenever the schema or prompt template changes.
+# lru_cache keys on all arguments, so a new value here causes every cached
+# entry to miss and rebuild — acting as a one-line cache invalidation.
+SCHEMA_VERSION = "1.0"
 
 
-def get_system_prompt(business_id: str, language: str = "en") -> str:
+@lru_cache(maxsize=512)
+def get_system_prompt(
+    language: str,
+    business_id: str,
+    schema_version: str = SCHEMA_VERSION,
+) -> str:
     """
-    Generate system prompt based on detected language
-    
+    Return the system prompt for the given business and language.
+
+    Results are memoised by lru_cache(maxsize=512), so only the 512 most
+    recently active (language, business_id, schema_version) combinations are
+    kept in memory.  The cache is bounded — old entries are evicted
+    automatically as new businesses connect.
+
     Args:
-        business_id: Business identifier for database filtering
-        language: "en" or "sw" for language-specific instructions
-        
+        language:       "en" or "sw" — controls response language mandate.
+        business_id:    Business identifier embedded in SQL examples.
+        schema_version: Opaque version token; changing SCHEMA_VERSION
+                        invalidates all cached prompts on next import.
+
     Returns:
-        Complete system prompt
+        Complete system prompt string.
     """
-    
-    # Import schema dynamically
-    sys.path.append(os.path.join(os.path.dirname(__file__), '../../mcp-server'))
-    
-    try:
-        from query_structure import get_schema_for_prompt
-        schema_info = get_schema_for_prompt()
-    except ImportError:
-        schema_info = """
-DATABASE SCHEMA (PostgreSQL):
-- inventories: id, business_id, name, rough_cost, status, created_by, created_at, updated_at
-- products: id, business_id, inventory_id, name, quantity, initial_quantity, created_at, updated_at
-- sales: id, business_id, product_id, quantity, price, total_amount (computed), created_by, sale_date, created_at
-- expenses: id, business_id, name, amount, receipt_url, created_by, expense_date, created_at
-"""
-    
-    # Language-specific instruction at the top
+    return _build_prompt(business_id, language)
+
+
+def _build_prompt(business_id: str, language: str) -> str:
+    """Construct the full system prompt. Called only on cache miss."""
+
     language_instruction = """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🌍 CRITICAL: RESPONSE LANGUAGE REQUIREMENT
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 """
-    
+
     if language == "sw":
         language_instruction += """
 ✅ YOU MUST RESPOND IN KISWAHILI ONLY - THIS IS MANDATORY
@@ -80,7 +90,7 @@ Examples of correct English responses:
 ❌ NEVER mix Kiswahili and English
 ❌ NEVER respond in Kiswahili when user writes in English
 """
-    
+
     return language_instruction + f"""
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -91,7 +101,7 @@ You are Karaba, a helpful business assistant for MSME owners in Tanzania using M
 
 CRITICAL RULES - FOLLOW EXACTLY:
 
-1. **NEVER SHOW SQL TO USERS** 
+1. **NEVER SHOW SQL TO USERS**
    - SQL queries are INTERNAL ONLY - users should NEVER see them
    - When you use the query_business_data tool, execute it silently
    - ONLY show the results in natural language
@@ -110,7 +120,7 @@ BUSINESS CONTEXT
 
 Business ID: {business_id}
 
-{schema_info}
+{_schema_info}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SQL QUERY RULES - FOLLOW EXACTLY
@@ -134,7 +144,7 @@ SQL QUERY RULES - FOLLOW EXACTLY
 
    b) Top selling products:
 ```sql
-   SELECT p.name as product_name, 
+   SELECT p.name as product_name,
           SUM(s.quantity) as total_sold,
           SUM(s.total_amount) as revenue
    FROM sales s
@@ -178,7 +188,7 @@ TOOL USAGE - CRITICAL INSTRUCTIONS
 ✅ User asks about THEIR specific data:
    English: "Show my sales", "How many products", "Total revenue", "This month"
    Kiswahili: "Mauzo yangu", "Nina bidhaa ngapi", "Mapato jumla", "Mwezi huu"
-   
+
 **When NOT to use tools:**
 ❌ General advice questions:
    English: "How can I improve sales?", "What are best practices?"
@@ -305,13 +315,3 @@ REMEMBER:
 5. Hide ALL technical errors - act like data doesn't exist yet
 6. Use bullet points (•) for lists
 7. Natural, conversational tone in the user's language"""
-
-
-def get_english_prompt(business_id: str) -> str:
-    """Legacy function - use get_system_prompt instead"""
-    return get_system_prompt(business_id, "en")
-
-
-def get_swahili_prompt(business_id: str) -> str:
-    """Legacy function - use get_system_prompt instead"""
-    return get_system_prompt(business_id, "sw")

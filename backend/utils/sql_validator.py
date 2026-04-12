@@ -1,230 +1,109 @@
 """
-SQL Query Validator and Sanitizer for Mali Daftari
-Ensures safe database queries with business_id filtering
+SQL Query Validator for Mali Daftari
+AST-based validation using sqlglot — eliminates regex fragility and correctly
+qualifies the tenant filter with the primary table alias, fixing the
+"ambiguous column reference" error that arises on JOIN queries.
 """
 
-import re
-from typing import Optional
 import logging
+import sqlglot
+import sqlglot.expressions as exp
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_TABLES: frozenset[str] = frozenset({
+    "sales",
+    "products",
+    "inventories",
+    "expenses",
+    "agent_interactions",
+})
 
-def validate_and_secure_sql(sql: str, business_id: str) -> Optional[str]:
-    """Validate and secure SQL query"""
-    # Normalize whitespace
-    sql = ' '.join(sql.split())
+
+def validate_query_complete(sql: str) -> str:
     """
-    Validate and secure SQL query
-    
-    Args:
-        sql: Raw SQL query from LLM
-        business_id: Business identifier to filter by
-        
+    Parse, validate, and secure a SQL query using AST analysis.
+
+    The function applies five sequential checks before returning the
+    secured query string:
+
+      1. Parse — reject anything sqlglot cannot parse as valid Postgres SQL.
+      2. SELECT-only — reject DDL, DML, and multi-statement inputs.
+      3. No set operations — reject UNION / INTERSECT / EXCEPT at any depth.
+      4. Table whitelist — reject references to tables outside ALLOWED_TABLES.
+      5. Tenant injection — prepend  <alias>.business_id = $1  to WHERE,
+         using the primary table's alias so JOINed queries are unambiguous.
+
+    Raises:
+        ValueError: For any query that fails a security or structural check.
+            The message describes which check failed and why.
+
     Returns:
-        Secured SQL query or None if invalid
+        Secured SQL string in Postgres dialect.  The caller must bind the
+        actual business_id value as the first positional parameter ($1) when
+        executing via asyncpg.
     """
-    
-    sql = sql.strip()
-    
-    # Remove markdown code blocks if present
-    sql = sql.replace('```sql', '').replace('```', '').strip()
-    
-    sql_upper = sql.upper()
-    
-    # Must be SELECT only
-    if not sql_upper.startswith('SELECT'):
-        logger.warning(f"Rejected non-SELECT query: {sql[:50]}...")
-        return None
-    
-    # Block dangerous keywords
-    dangerous = [
-        'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 
-        'CREATE', 'TRUNCATE', 'EXEC', 'EXECUTE', '--', ';--',
-        'PRAGMA', 'GRANT', 'REVOKE', 'INTO', 'INFORMATION_SCHEMA',
-        'PG_', 'COPY', 'VACUUM'
-    ]
-    
-    for keyword in dangerous:
-        if keyword in sql_upper:
-            logger.warning(f"Rejected query with dangerous keyword '{keyword}': {sql[:50]}...")
-            return None
-    
-    # Check for multiple statements (basic check)
-    if sql.count(';') > 1 or ';' in sql[:-1]:
-        logger.warning(f"Rejected query with multiple statements: {sql[:50]}...")
-        return None
-    
-    # Add business_id filter (critical security measure)
-    sql = add_business_filter(sql, business_id)
-    
-    # Verify business_id was actually added
-    if f"business_id = '{business_id}'" not in sql:
-        logger.error(f"Failed to add business_id filter to query: {sql[:50]}...")
-        return None
-    
-    # Add LIMIT if not present (prevent huge result sets)
-    if 'LIMIT' not in sql_upper:
-        sql = sql.rstrip(';') + ' LIMIT 1000'
-    
-    logger.debug(f"Validated query: {sql}")
-    
-    return sql
+    # Strip markdown fences that the LLM sometimes wraps the SQL in.
+    sql = sql.replace("```sql", "").replace("```", "").strip()
 
+    # ── 1. Parse ─────────────────────────────────────────────────────────────
+    try:
+        statements = sqlglot.parse(sql, read="postgres")
+    except sqlglot.errors.ParseError as exc:
+        raise ValueError(f"SQL parse error: {exc}") from exc
 
-def add_business_filter(sql: str, business_id: str) -> str:
-    """
-    Add business_id filter to SQL query
-    Critical security function - ensures data isolation
-    
-    Args:
-        sql: Original SQL query
-        business_id: Business identifier
-        
-    Returns:
-        SQL with business_id filter injected
-    """
-    
-    safe_business_id = business_id.replace("'", "''")
-    sql_upper = sql.upper()
-    
-    # Escape single quotes in business_id (prevent SQL injection)
-    safe_business_id = business_id.replace("'", "''")
-    
-    business_filter = f"business_id = '{safe_business_id}'"
-    
-    # Strategy: Find the best place to inject the WHERE clause
-    
-    # Case 1: Query already has WHERE clause
-    if ' WHERE ' in sql_upper:
-        where_idx = sql_upper.find(' WHERE ') + 7
-        return (
-            sql[:where_idx] + 
-            f"{business_filter} AND " + 
-            sql[where_idx:]
+    if len(statements) != 1:
+        raise ValueError(
+            f"Exactly one SQL statement is required, got {len(statements)}"
         )
-    
-    # Case 2: Query has GROUP BY (add WHERE before it)
-    elif ' GROUP BY ' in sql_upper:
-        group_idx = sql_upper.find(' GROUP BY ')
-        return (
-            sql[:group_idx] + 
-            f" WHERE {business_filter} " + 
-            sql[group_idx:]
+
+    tree = statements[0]
+
+    # ── 2. SELECT only ────────────────────────────────────────────────────────
+    # parse() returns the root node of the expression tree.  A top-level UNION
+    # parses to exp.Union (not exp.Select), so this check catches that case
+    # automatically in addition to DDL/DML.
+    if not isinstance(tree, exp.Select):
+        raise ValueError(
+            f"Only SELECT statements are allowed, got: {type(tree).__name__}"
         )
-    
-    # Case 3: Query has HAVING (add WHERE before GROUP BY/HAVING)
-    elif ' HAVING ' in sql_upper:
-        having_idx = sql_upper.find(' HAVING ')
-        return (
-            sql[:having_idx] + 
-            f" WHERE {business_filter} " + 
-            sql[having_idx:]
-        )
-    
-    # Case 4: Query has ORDER BY
-    elif ' ORDER BY ' in sql_upper:
-        order_idx = sql_upper.find(' ORDER BY ')
-        return (
-            sql[:order_idx] + 
-            f" WHERE {business_filter} " + 
-            sql[order_idx:]
-        )
-    
-    # Case 5: Query has LIMIT
-    elif ' LIMIT ' in sql_upper:
-        limit_idx = sql_upper.find(' LIMIT ')
-        return (
-            sql[:limit_idx] + 
-            f" WHERE {business_filter} " + 
-            sql[limit_idx:]
-        )
-    
-    # Case 6: Simple query - append WHERE clause
-    else:
-        return sql.rstrip(';') + f" WHERE {business_filter}"
 
+    # ── 3. Block set operations ───────────────────────────────────────────────
+    # A top-level UNION was already rejected above.  This walk catches set ops
+    # nested inside subqueries (e.g. SELECT … FROM (SELECT … UNION …) sub).
+    for set_op_type in (exp.Union, exp.Intersect, exp.Except):
+        if tree.find(set_op_type) is not None:
+            raise ValueError(
+                f"Set operations ({set_op_type.__name__}) are not permitted"
+            )
 
-def extract_table_names(sql: str) -> list[str]:
-    """
-    Extract table names from SQL query (for logging/debugging)
-    
-    Args:
-        sql: SQL query
-        
-    Returns:
-        List of table names found in query
-    """
-    sql_upper = sql.upper()
-    tables = []
-    
-    # Extract from FROM clause
-    from_match = re.search(r'FROM\s+(\w+)', sql_upper)
-    if from_match:
-        tables.append(from_match.group(1).lower())
-    
-    # Extract from JOINs
-    join_matches = re.finditer(r'JOIN\s+(\w+)', sql_upper)
-    for match in join_matches:
-        tables.append(match.group(1).lower())
-    
-    return tables
+    # ── 4. Table whitelist ────────────────────────────────────────────────────
+    # find_all(exp.Table) walks the entire tree, so it catches tables in
+    # subqueries and JOINs, not just the primary FROM clause.
+    for table_node in tree.find_all(exp.Table):
+        name = table_node.name.lower()
+        if name not in ALLOWED_TABLES:
+            raise ValueError(f"Table '{name}' is not in the allowed list")
 
+    # ── 5. Inject tenant filter (alias-qualified) ─────────────────────────────
+    from_clause = tree.args.get("from")
+    if from_clause is None:
+        raise ValueError("Query has no FROM clause")
 
-def validate_allowed_tables(sql: str, allowed_tables: list[str]) -> bool:
-    """
-    Verify query only accesses allowed tables
-    
-    Args:
-        sql: SQL query
-        allowed_tables: List of allowed table names
-        
-    Returns:
-        True if all tables are allowed, False otherwise
-    """
-    query_tables = extract_table_names(sql)
-    
-    for table in query_tables:
-        if table not in allowed_tables:
-            logger.warning(f"Query attempts to access unauthorized table: {table}")
-            return False
-    
-    return True
+    primary_table = from_clause.find(exp.Table)
+    if primary_table is None:
+        raise ValueError("Could not identify primary table in the FROM clause")
 
+    # alias_or_name returns the alias when one was set (e.g. "s" for "sales s")
+    # and falls back to the bare table name when no alias exists (e.g. "sales").
+    # Qualifying the column with this value makes the filter unambiguous even
+    # when the query JOINs multiple tables that all have a business_id column.
+    qualifier = primary_table.alias_or_name
 
-# Allowed tables for Mali Daftari
-ALLOWED_TABLES = [
-    'inventories',
-    'products',
-    'sales',
-    'expenses',
-    'businesses'  # Read-only for business info
-]
+    tree = tree.where(
+        f"{qualifier}.business_id = $1",
+        dialect="postgres",
+    )
 
-
-def validate_query_complete(sql: str, business_id: str) -> Optional[str]:
-    """
-    Complete validation pipeline
-    
-    Args:
-        sql: Raw SQL query
-        business_id: Business identifier
-        
-    Returns:
-        Secured SQL or None if invalid
-    """
-    
-    # Step 1: Basic validation and securing
-    secured_sql = validate_and_secure_sql(sql, business_id)
-    
-    if not secured_sql:
-        return None
-    
-    # Step 2: Validate table access
-    if not validate_allowed_tables(secured_sql, ALLOWED_TABLES):
-        logger.error(f"Query accesses unauthorized tables: {sql[:50]}...")
-        return None
-    
-    logger.info(f"✅ Query validated successfully")
-    
-    return secured_sql
+    # ── 6. Return secured SQL ─────────────────────────────────────────────────
+    return tree.sql(dialect="postgres")
