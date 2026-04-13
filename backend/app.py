@@ -1,29 +1,31 @@
 """
-Mali Daftari Backend - FastAPI WebSocket Server
-Uses Claude's native multilingual capabilities for bilingual support
+Mali Daftari Backend - FastAPI REST + SSE Server
+Stateless architecture: JWT auth via Bearer header, SSE for streaming responses.
 """
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import asyncio
 import json
-import jwt
-import os
-from datetime import datetime
-from anthropic import AsyncAnthropic
-from typing import Dict, Literal
 import logging
+import os
 import time
-import uuid
+from datetime import datetime
+from typing import AsyncGenerator, Dict, List, Literal
+
+import jwt
+from anthropic import AsyncAnthropic
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from config import Config
-from utils.greetings import get_time_aware_greeting
-from utils.sql_validator import validate_query_complete
-from utils.mcp_client import MCPClient
 from prompts.system_prompt import get_system_prompt
 from query_router import get_query_router
+from utils.greetings import get_time_aware_greeting
+from utils.mcp_client import MCPClient
+from utils.sql_validator import validate_query_complete
 
-# Logging setup
+# ── Logging ──────────────────────────────────────────────────────────────────
+
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
     level=getattr(logging, os.getenv('LOG_LEVEL', 'INFO').upper()),
@@ -35,14 +37,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI
+# ── App ───────────────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title="Mali Daftari Business Assistant API",
-    version="2.0.0",
-    description="AI-powered bilingual business assistant for MSME owners (using Claude's native multilingual capabilities)"
+    version="3.0.0",
+    description="AI-powered bilingual business assistant for MSME owners (REST + SSE)"
 )
 
-# Validate config on startup
 try:
     Config.validate()
     logger.info("✅ Configuration validated successfully")
@@ -50,30 +52,26 @@ except ValueError as e:
     logger.error(f"❌ Configuration error: {str(e)}")
     raise
 
-# Initialize clients
 config = Config()
 
-# Initialize Anthropic Claude
 anthropic_client = AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
 logger.info(f"✅ Using Anthropic Claude: {config.ANTHROPIC_MODEL}")
 
-# Initialize MCP Client
 mcp_client = MCPClient(config.MCP_SERVER_URL)
 logger.info(f"✅ MCP Server configured: {config.MCP_SERVER_URL}")
 
-# Initialize Query Router
 query_router = get_query_router()
 logger.info("✅ Query router initialized")
-logger.info("✅ Using Claude's native multilingual capabilities (no translation models needed)")
 
-# MCP Tools Definition
+# ── MCP Tool Schema ───────────────────────────────────────────────────────────
+
 MCP_TOOLS = [{
     "name": "query_business_data",
-    "description": """Query business data from PostgreSQL database. 
+    "description": """Query business data from PostgreSQL database.
     Available tables: inventories, products, sales, expenses.
     Use this tool when the user asks about their specific business data (sales, inventory, expenses).
     Do NOT use this for general business advice questions.
-    
+
     CRITICAL: Execute this tool silently - users should NEVER see the SQL query, only the results.""",
     "input_schema": {
         "type": "object",
@@ -91,53 +89,87 @@ MCP_TOOLS = [{
     }
 }]
 
+# ── Pydantic Models ───────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    business_id: str
+    session_id: str
+    message: str
+    context: List[Dict] = []
+
+# ── Auth Dependency ───────────────────────────────────────────────────────────
+
+async def verify_token(authorization: str = Header(...)) -> str:
+    """Validate Supabase JWT from Authorization: Bearer header.
+
+    Returns:
+        user_id (str) extracted from the token's 'sub' claim.
+
+    Raises:
+        HTTPException 401 on any auth failure.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    token = authorization.removeprefix("Bearer ")
+    try:
+        claims = jwt.decode(
+            token,
+            config.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated",
+        )
+        user_id = claims.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
+        return user_id
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+
+# ── Core Pipeline (unchanged) ─────────────────────────────────────────────────
 
 def detect_language(text: str) -> Literal["sw", "en"]:
     """
-    Simple keyword-based language detection
-    No ML models needed - just pattern matching
-    
+    Simple keyword-based language detection.
+    No ML models needed - just pattern matching.
+
     Args:
         text: Input text to analyze
-        
+
     Returns:
         "sw" for Kiswahili, "en" for English
     """
     swahili_indicators = [
         # Greetings
         'habari', 'mambo', 'hujambo', 'shikamoo', 'vipi', 'poa',
-        
+
         # Common verbs
         'nionyeshe', 'nina', 'niko', 'nataka', 'ninahitaji',
         'tafadhali', 'nitumie', 'nipatie', 'naweza', 'unaweza',
-        
+
         # Business terms
         'mauzo', 'bidhaa', 'bei', 'gharama', 'faida',
         'hifadhi', 'duka', 'mteja', 'wateja',
-        
+
         # Time expressions
         'leo', 'jana', 'kesho', 'wiki', 'mwezi', 'mwaka',
-        
+
         # Question words
         'je', 'nini', 'ngapi', 'vipi', 'lini', 'wapi', 'nani',
-        
+
         # Common words
         'ya', 'za', 'wa', 'na', 'kwa', 'au', 'ni',
         'jumla', 'kiasi', 'pesa', 'shilingi',
-        
+
         # Possessives
         'yangu', 'yako', 'yake', 'zako', 'zangu',
-        
+
         # Other common
         'inaendeleaje', 'namna', 'siku', 'kila'
     ]
-    
+
     text_lower = text.lower()
-    
-    # Count Kiswahili indicators
     sw_count = sum(1 for indicator in swahili_indicators if indicator in text_lower)
-    
-    # If 2 or more Kiswahili words found, classify as Kiswahili
+
     if sw_count >= 2:
         logger.debug(f"Detected Kiswahili ({sw_count} indicators found)")
         return "sw"
@@ -147,20 +179,13 @@ def detect_language(text: str) -> Literal["sw", "en"]:
 
 
 async def execute_mcp_tool(sql_query: str, business_id: str) -> Dict:
-    """Execute SQL query via MCP server with security validation"""
+    """Execute SQL query via MCP server with security validation."""
     try:
-        # Validate and secure the query — raises ValueError if rejected.
-        # business_id is NOT passed to the validator; instead the validator
-        # injects the $1 placeholder and the value is bound here as a parameter.
         secured_query = validate_query_complete(sql_query)
 
         logger.info(f"🔍 Executing secured query for business {business_id[:8]}...")
         logger.debug(f"SQL: {secured_query}")
 
-        # Execute via MCP — business_id is bound as the first positional
-        # parameter ($1) by asyncpg, never interpolated into the SQL string.
-        # It is also forwarded in the X-Business-ID header so the MCP server's
-        # rate limiter applies a per-tenant quota rather than a shared one.
         result = await mcp_client.execute_query(
             secured_query, params=[business_id], business_id=business_id
         )
@@ -208,10 +233,8 @@ async def log_interaction(
 ):
     """Log interaction to MCP server for admin monitoring.
 
-    Runs as a fire-and-forget background task via asyncio.create_task(), so
-    exceptions must be caught here — an unhandled exception in a Task silently
-    drops the result and can log spurious 'Task exception was never retrieved'
-    warnings to the event loop.
+    Fire-and-forget via asyncio.create_task() — exceptions are caught here
+    to avoid spurious 'Task exception was never retrieved' warnings.
     """
     try:
         await mcp_client.log_interaction({
@@ -247,27 +270,36 @@ def classify_query_intent(message: str, language: str) -> tuple[bool, str]:
     return is_data_query, query_type
 
 
-async def handle_conversational_query(message: str, business_id: str, language: str) -> str:
-    """Call Claude without tools for a general/advice response.
+async def execute_business_query(sql_query: str, business_id: str) -> tuple[Dict, bool, str]:
+    """Validate and run a SQL query via the MCP client.
 
     Returns:
-        Natural language response text.
+        (tool_result, success, error_message)
+        Never raises — surfaces errors as data so the caller can continue.
     """
-    response = await anthropic_client.messages.create(
-        model=config.ANTHROPIC_MODEL,
-        max_tokens=4096,
-        system=get_system_prompt(language=language, business_id=business_id),
-        messages=[{"role": "user", "content": message}],
-        tools=[],
-    )
-    return next(
-        (block.text for block in response.content if hasattr(block, "text")),
-        "I couldn't generate a response."
-    )
+    tool_result = await execute_mcp_tool(sql_query, business_id)
+    success = tool_result.get("success", False)
+    error_message = None
 
+    if not success:
+        error_message = tool_result.get("error", "Unknown error")
+        logger.warning(f"⚠️ Query failed: {error_message}")
+    else:
+        logger.info(f"✅ Query successful: {tool_result.get('row_count', 0)} rows")
 
-async def generate_sql_with_llm(message: str, business_id: str, language: str) -> tuple:
-    """First Claude call for data queries: let Claude decide if it needs to query the DB.
+    return tool_result, success, error_message
+
+# ── Transport Layer ───────────────────────────────────────────────────────────
+
+async def generate_sql_with_llm(
+    message: str,
+    business_id: str,
+    language: str,
+    context: List[Dict],
+) -> tuple:
+    """First Claude call for data queries: let Claude decide if it needs the DB.
+
+    Includes conversation context so Claude has prior turn history.
 
     Returns:
         (response, tool_use_block, generated_sql)
@@ -277,7 +309,7 @@ async def generate_sql_with_llm(message: str, business_id: str, language: str) -
         model=config.ANTHROPIC_MODEL,
         max_tokens=4096,
         system=get_system_prompt(language=language, business_id=business_id),
-        messages=[{"role": "user", "content": message}],
+        messages=[*context, {"role": "user", "content": message}],
         tools=MCP_TOOLS,
     )
     logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
@@ -294,114 +326,121 @@ async def generate_sql_with_llm(message: str, business_id: str, language: str) -
     return response, tool_use, generated_sql
 
 
-async def execute_business_query(sql_query: str, business_id: str) -> tuple[Dict, bool, str]:
-    """Validate and run a SQL query via the MCP client.
-
-    Returns:
-        (tool_result, success, error_message)
-        Never raises — surfaces errors as data so the orchestrator can continue.
-    """
-    tool_result = await execute_mcp_tool(sql_query, business_id)
-    success = tool_result.get("success", False)
-    error_message = None
-
-    if not success:
-        error_message = tool_result.get("error", "Unknown error")
-        logger.warning(f"⚠️ Query failed: {error_message}")
-    else:
-        logger.info(f"✅ Query successful: {tool_result.get('row_count', 0)} rows")
-
-    return tool_result, success, error_message
-
-
-async def format_data_response(
-    message: str,
-    business_id: str,
-    language: str,
-    first_response,
-    tool_use,
-    tool_result: Dict,
-) -> str:
-    """Second Claude call: turn raw DB rows into a natural language answer.
-
-    Returns:
-        Formatted response text in the user's language.
-    """
-    final_response = await anthropic_client.messages.create(
-        model=config.ANTHROPIC_MODEL,
-        max_tokens=4096,
-        system=get_system_prompt(language=language, business_id=business_id),
-        messages=[
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": first_response.content},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": json.dumps(tool_result),
-                    }
-                ],
-            },
-        ],
-        tools=MCP_TOOLS,
-    )
-    return next(
-        (block.text for block in final_response.content if hasattr(block, "text")),
-        "I couldn't generate a response."
-    )
-
-
-async def process_message(
+async def generate_response(
     message: str,
     business_id: str,
     user_id: str,
     session_id: str,
-) -> tuple[str, str]:
-    """High-level orchestrator: detect → route → query → format → log.
+    context: List[Dict],
+) -> AsyncGenerator[str, None]:
+    """SSE streaming generator: orchestrates the full pipeline and streams
+    Claude's response chunk-by-chunk.
 
-    Returns:
-        (response_text, detected_language)
+    Yields SSE-formatted strings:
+        data: {"chunk": "<text>"}\\n\\n  — for each text delta
+        data: {"type": "done"}\\n\\n     — on success
+        data: {"type": "done", "error": true}\\n\\n  — on failure
+
+    Logging is fired as a background task in the finally block so it always
+    runs regardless of client disconnect or exceptions.
     """
     start_time = time.time()
     generated_sql = None
     query_type = "conversational"
     query_success = False
     error_message = None
+    full_response: List[str] = []
+
+    # Detect language outside the try block so it's always available for logging.
+    language = detect_language(message)
+    logger.info(f"🌍 Detected language: {language.upper()}")
 
     try:
-        logger.info(f"💬 Processing message from user {user_id[:8]}...: {message[:50]}...")
-
-        language = detect_language(message)
-        logger.info(f"🌍 Detected language: {language.upper()}")
+        logger.info(f"💬 Processing message: {message[:50]}...")
 
         is_data_query, query_type = classify_query_intent(message, language)
 
         if is_data_query:
+            # ── Step 1: non-streaming call to obtain SQL (tool use) ──────────
             first_response, tool_use, generated_sql = await generate_sql_with_llm(
-                message, business_id, language
+                message, business_id, language, context
             )
+
             if tool_use is not None:
+                # ── Step 2: execute SQL against the DB ───────────────────────
                 tool_result, query_success, error_message = await execute_business_query(
                     generated_sql, business_id
                 )
-                response_text = await format_data_response(
-                    message, business_id, language, first_response, tool_use, tool_result
-                )
+
+                # ── Step 3: stream the formatting (second) Claude call ───────
+                async with anthropic_client.messages.stream(
+                    model=config.ANTHROPIC_MODEL,
+                    max_tokens=4096,
+                    system=get_system_prompt(language=language, business_id=business_id),
+                    messages=[
+                        *context,
+                        {"role": "user", "content": message},
+                        {"role": "assistant", "content": first_response.content},
+                        {
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": tool_use.id,
+                                "content": json.dumps(tool_result),
+                            }],
+                        },
+                    ],
+                    tools=MCP_TOOLS,
+                ) as stream:
+                    async for chunk in stream.text_stream:
+                        full_response.append(chunk)
+                        yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+
             else:
+                # Claude answered without querying the DB (e.g. data not needed).
                 query_success = True
-                response_text = next(
+                text = next(
                     (block.text for block in first_response.content if hasattr(block, "text")),
-                    "I couldn't generate a response."
+                    "",
                 )
+                full_response.append(text)
+                yield f"data: {json.dumps({'chunk': text})}\n\n"
+
         else:
+            # ── Conversational: stream Claude response directly ───────────────
             query_success = True
-            response_text = await handle_conversational_query(message, business_id, language)
+            async with anthropic_client.messages.stream(
+                model=config.ANTHROPIC_MODEL,
+                max_tokens=4096,
+                system=get_system_prompt(language=language, business_id=business_id),
+                messages=[*context, {"role": "user", "content": message}],
+                tools=[],
+            ) as stream:
+                async for chunk in stream.text_stream:
+                    full_response.append(chunk)
+                    yield f"data: {json.dumps({'chunk': chunk})}\n\n"
 
         processing_time_ms = int((time.time() - start_time) * 1000)
-        logger.info(f"✅ Response in {language.upper()}: {len(response_text)} chars in {processing_time_ms}ms")
+        logger.info(
+            f"✅ Stream complete — {len(''.join(full_response))} chars "
+            f"in {processing_time_ms}ms"
+        )
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
+    except Exception as e:
+        logger.error(f"❌ Error in generate_response: {e}", exc_info=True)
+        error_message = str(e)
+        err_text = (
+            "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
+            if language == "sw"
+            else "I apologize, but I encountered an error. Please try again."
+        )
+        full_response.append(err_text)
+        yield f"data: {json.dumps({'chunk': err_text})}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'error': True})}\n\n"
+
+    finally:
+        processing_time_ms = int((time.time() - start_time) * 1000)
         asyncio.create_task(log_interaction(
             business_id=business_id,
             session_id=session_id,
@@ -410,168 +449,88 @@ async def process_message(
             query_type=query_type,
             generated_sql=generated_sql,
             query_success=query_success,
-            response_text=response_text,
+            response_text="".join(full_response),
             processing_time_ms=processing_time_ms,
+            error_message=error_message,
         ))
 
-        return response_text, language
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
-    except Exception as e:
-        logger.error(f"❌ Error processing message: {str(e)}", exc_info=True)
-        processing_time_ms = int((time.time() - start_time) * 1000)
-        language = detect_language(message)
+@app.get("/chat/greeting")
+async def get_greeting(
+    business_id: str = Query(..., description="Business UUID"),
+    user_id: str = Depends(verify_token),
+):
+    """Return a personalised, time-aware Swahili greeting for the business owner.
 
-        asyncio.create_task(log_interaction(
-            business_id=business_id,
-            session_id=session_id,
-            original_query=message,
-            language=language,
-            query_type=query_type,
-            generated_sql=generated_sql,
-            query_success=False,
-            response_text="Error occurred",
-            processing_time_ms=processing_time_ms,
-            error_message=str(e),
-        ))
+    The client calls this once on session open, before any chat messages.
+    Auth: Authorization: Bearer <supabase-jwt>
+    """
+    is_owner = await mcp_client.verify_business_owner(user_id, business_id)
+    if not is_owner:
+        raise HTTPException(status_code=403, detail="Access denied")
 
-        error_msg = (
-            "Samahani, nimekutana na hitilafu. Tafadhali jaribu tena."
-            if language == "sw"
-            else "I apologize, but I encountered an error. Please try again."
-        )
-        return error_msg, language
+    business_name = await mcp_client.get_business_name(business_id)
+    greeting = get_time_aware_greeting(business_name)
+
+    return {
+        "greeting": greeting,
+        "language": "sw",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
-@app.websocket("/ws/chat")
-async def chat_websocket(websocket: WebSocket):
-    """WebSocket endpoint for chat — requires JWT + owner verification on handshake."""
-    await websocket.accept()
+@app.post("/chat/message")
+async def chat_message(
+    request: ChatRequest,
+    user_id: str = Depends(verify_token),
+):
+    """Process a chat message and stream the response via Server-Sent Events.
 
-    user_id = None
-    business_id = None
-    session_id = None
+    Auth: Authorization: Bearer <supabase-jwt>
+    Body: { business_id, session_id, message, context }
 
-    try:
-        # ── Phase 1: read handshake payload ──────────────────────────────────
-        init_data = await websocket.receive_json()
-        token = init_data.get("token")
-        business_id = init_data.get("business_id")
+    SSE events:
+        data: {"chunk": "..."}            — text delta (one or more)
+        data: {"type": "done"}            — stream complete
+        data: {"type": "done", "error": true}  — error occurred
+    """
+    is_owner = await mcp_client.verify_business_owner(user_id, request.business_id)
+    if not is_owner:
+        raise HTTPException(status_code=403, detail="Access denied")
 
-        if not token or not business_id:
-            logger.warning("WebSocket rejected: missing token or business_id")
-            await websocket.close(code=1008)
-            return
-
-        # ── Phase 2: decode & verify JWT ─────────────────────────────────────
-        try:
-            claims = jwt.decode(
-                token,
-                config.SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                audience="authenticated",
-            )
-            user_id = claims.get("sub")
-            if not user_id:
-                raise jwt.InvalidTokenError("Missing 'sub' claim")
-        except jwt.PyJWTError as exc:
-            logger.warning(f"WebSocket rejected: invalid JWT — {exc}")
-            await websocket.close(code=1008)
-            return
-
-        # ── Phase 3: check business ownership ────────────────────────────────
-        is_owner = await mcp_client.verify_business_owner(user_id, business_id)
-        if not is_owner:
-            logger.warning(
-                f"WebSocket rejected: user={user_id[:8]}... is not owner of "
-                f"business={business_id[:8]}..."
-            )
-            await websocket.close(code=1008)
-            return
-
-        # ── Auth passed — start session ───────────────────────────────────────
-        session_id = str(uuid.uuid4())
-        logger.info(
-            f"🔌 WebSocket connected: user={user_id[:8]}..., "
-            f"business={business_id[:8]}..., session={session_id[:8]}..."
-        )
-
-        # ── Frame 1: silent session handshake (not shown to user) ───────────
-        await websocket.send_json({
-            "type": "connected",
-            "session_id": session_id,
-            "timestamp": datetime.utcnow().isoformat(),
-        })
-
-        # ── Frame 2: personalised greeting ────────────────────────────────────
-        # Kick off the business-name DB lookup and the typing delay in parallel
-        # so the greeting arrives exactly 1.2 s after the connected frame
-        # regardless of how fast the database responds.
-        business_name_task = asyncio.create_task(
-            mcp_client.get_business_name(business_id)
-        )
-        await asyncio.sleep(1.2)
-        business_name = await business_name_task
-
-        greeting = get_time_aware_greeting(business_name)
-        await websocket.send_json({
-            "type": "greeting",
-            "content": greeting,
-            "language": "sw",
-            "timestamp": datetime.utcnow().isoformat(),
-        })
-
-        # ── Message loop ──────────────────────────────────────────────────────
-        while True:
-            data = await websocket.receive_json()
-            message = data.get("message", "").strip()
-
-            if not message:
-                continue
-
-            logger.info(f"📨 Message received: {message[:100]}...")
-
-            response_text, detected_language = await process_message(
-                message, business_id, user_id, session_id
-            )
-
-            await websocket.send_json({
-                "type": "message",
-                "content": response_text,
-                "language": detected_language,
-                "timestamp": datetime.utcnow().isoformat(),
-            })
-
-    except WebSocketDisconnect:
-        logger.info(
-            f"🔌 WebSocket disconnected: user={user_id[:8] if user_id else 'unknown'}, "
-            f"session={session_id[:8] if session_id else 'none'}"
-        )
-    except Exception as e:
-        logger.error(f"❌ WebSocket error: {str(e)}", exc_info=True)
-        try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
-            pass
+    return StreamingResponse(
+        generate_response(
+            message=request.message,
+            business_id=request.business_id,
+            user_id=user_id,
+            session_id=request.session_id,
+            context=request.context,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable Nginx buffering for SSE
+        },
+    )
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint."""
     try:
         mcp_status = await mcp_client.health_check()
-        
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "mcp_server": "connected" if mcp_status else "disconnected",
-            "translation": "native_multilingual",
             "ai_provider": "Anthropic Claude",
             "model": config.ANTHROPIC_MODEL,
             "environment": config.ENVIRONMENT,
             "features": {
                 "bilingual": True,
                 "languages": ["English", "Kiswahili"],
-                "translation_method": "Claude native (no external models)"
+                "transport": "REST + SSE",
             }
         }
     except Exception as e:
@@ -585,31 +544,32 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    """Root endpoint"""
+    """Root endpoint."""
     return {
         "service": "Mali Daftari Business Assistant",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "status": "running",
         "ai_provider": "Anthropic Claude",
         "model": config.ANTHROPIC_MODEL,
         "features": {
             "bilingual_support": True,
             "languages": ["English", "Kiswahili"],
-            "translation_method": "Claude native multilingual",
+            "transport": "REST + SSE (stateless)",
             "intelligent_routing": True,
-            "performance_monitoring": True
+            "performance_monitoring": True,
         },
         "endpoints": {
-            "websocket": "/ws/chat",
-            "health": "/health",
-            "docs": "/docs"
+            "greeting": "GET /chat/greeting?business_id=<uuid>",
+            "message":  "POST /chat/message",
+            "health":   "GET /health",
+            "docs":     "GET /docs",
         }
     }
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    """Close the persistent MCP HTTP client on server shutdown"""
+    """Close the persistent MCP HTTP client on server shutdown."""
     await mcp_client.close()
     logger.info("✅ MCP client closed")
 
