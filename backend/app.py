@@ -327,6 +327,74 @@ async def generate_sql_with_llm(
     return response, tool_use, generated_sql
 
 
+_CONTEXT_MAX_TURNS = 10   # max round-trips kept (20 messages)
+_CONTEXT_MAX_CHARS = 8_000  # hard cap on total character volume
+
+
+def _sanitize_context(context: List[Dict]) -> List[Dict]:
+    """Validate and sanitize client-supplied conversation context.
+
+    Security rules applied in order:
+    1. Hard cap: keep only the most recent _CONTEXT_MAX_TURNS turns so a
+       client cannot inflate token usage or bury the system prompt.
+    2. Role allowlist: only "user" and "assistant" are forwarded to the API.
+       Any other role (e.g. "system") is dropped — a "system" role message
+       from the client could override the server-controlled system prompt.
+    3. Content type: only plain strings are accepted. List-valued content
+       (raw API objects containing tool_use / tool_result blocks) is either
+       collapsed to its text portions or dropped entirely.
+    4. Empty messages: stripped after sanitization.
+    5. Total character cap: if the sanitized context exceeds _CONTEXT_MAX_CHARS,
+       the oldest messages are trimmed until it fits.
+    """
+    ALLOWED_ROLES = {"user", "assistant"}
+
+    # Step 1 — keep only the tail of the history (most recent turns).
+    # Multiply by 2 because each turn = 1 user + 1 assistant message.
+    context = context[-(  _CONTEXT_MAX_TURNS * 2):]
+
+    clean: List[Dict] = []
+    for msg in context:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # Step 2 — role allowlist.
+        if role not in ALLOWED_ROLES:
+            logger.warning(f"Context message with disallowed role '{role}' dropped")
+            continue
+
+        # Step 3 — normalise content to a plain string.
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            # Drop user messages that are purely tool_result exchanges.
+            if role == "user" and all(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                continue
+            # Collapse any remaining list content to text blocks only.
+            text = "".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+        else:
+            continue
+
+        # Step 4 — drop empty messages.
+        if not text:
+            continue
+
+        clean.append({"role": role, "content": text})
+
+    # Step 5 — total character cap: trim oldest messages first.
+    while clean and sum(len(m["content"]) for m in clean) > _CONTEXT_MAX_CHARS:
+        clean.pop(0)
+
+    return clean
+
+
 async def generate_response(
     message: str,
     business_id: str,
@@ -351,6 +419,10 @@ async def generate_response(
     query_success = False
     error_message = None
     full_response: List[str] = []
+
+    # Sanitize context before any API call to remove orphaned tool_use/
+    # tool_result blocks that would cause a 400 from the Anthropic API.
+    context = _sanitize_context(context)
 
     # Detect language outside the try block so it's always available for logging.
     language = detect_language(message)
