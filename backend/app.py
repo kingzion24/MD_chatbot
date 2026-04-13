@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Dict, List, Literal
 
@@ -470,13 +471,13 @@ async def get_greeting(
     if not is_owner:
         raise HTTPException(status_code=403, detail="Access denied")
 
+    session_id = str(uuid.uuid4())
     business_name = await mcp_client.get_business_name(business_id)
     greeting = get_time_aware_greeting(business_name)
 
     return {
-        "greeting": greeting,
-        "language": "sw",
-        "timestamp": datetime.utcnow().isoformat(),
+        "session_id": session_id,
+        "content": greeting,
     }
 
 
