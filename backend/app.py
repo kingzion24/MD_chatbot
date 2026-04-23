@@ -303,8 +303,9 @@ async def generate_sql_with_llm(
     Includes conversation context so Claude has prior turn history.
 
     Returns:
-        (response, tool_use_block, generated_sql)
-        tool_use_block and generated_sql are None if Claude answered directly.
+        (response, tool_use_blocks, generated_sqls)
+        tool_use_blocks is [] and generated_sqls is [] if Claude answered directly.
+        Claude may return multiple tool_use blocks (e.g. one per time period).
     """
     response = await anthropic_client.messages.create(
         model=config.ANTHROPIC_MODEL,
@@ -316,15 +317,18 @@ async def generate_sql_with_llm(
     logger.info(f"🤖 Claude responded with stop_reason: {response.stop_reason}")
 
     if response.stop_reason != "tool_use":
-        return response, None, None
+        return response, [], []
 
-    tool_use = next(block for block in response.content if block.type == "tool_use")
-    generated_sql = tool_use.input.get("query", "")
-    logger.info(f"🔧 Tool requested: {tool_use.name}")
-    if "explanation" in tool_use.input:
-        logger.info(f"📝 Query explanation: {tool_use.input['explanation']}")
+    tool_uses = [block for block in response.content if block.type == "tool_use"]
+    generated_sqls = []
+    for tu in tool_uses:
+        sql = tu.input.get("query", "")
+        generated_sqls.append(sql)
+        logger.info(f"🔧 Tool requested: {tu.name}")
+        if "explanation" in tu.input:
+            logger.info(f"📝 Query explanation: {tu.input['explanation']}")
 
-    return response, tool_use, generated_sql
+    return response, tool_uses, generated_sqls
 
 
 def _sanitize_context(context: List[Dict]) -> List[Dict]:
@@ -431,15 +435,28 @@ async def generate_response(
 
         if is_data_query:
             # ── Step 1: non-streaming call to obtain SQL (tool use) ──────────
-            first_response, tool_use, generated_sql = await generate_sql_with_llm(
+            first_response, tool_uses, generated_sqls = await generate_sql_with_llm(
                 message, business_id, language, context
             )
 
-            if tool_use is not None:
-                # ── Step 2: execute SQL against the DB ───────────────────────
-                tool_result, query_success, error_message = await execute_business_query(
-                    generated_sql, business_id
-                )
+            if tool_uses:
+                # ── Step 2: execute ALL SQL queries against the DB ───────────
+                # Claude may request multiple queries (e.g. this month + last month).
+                # Every tool_use block must have a matching tool_result in the next
+                # message or the Anthropic API will return a 400.
+                all_tool_results = []
+                generated_sql = "; ".join(generated_sqls)
+                for tu, sql in zip(tool_uses, generated_sqls):
+                    tool_result, success, err = await execute_business_query(sql, business_id)
+                    if success:
+                        query_success = True
+                    elif error_message is None:
+                        error_message = err
+                    all_tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": json.dumps(tool_result),
+                    })
 
                 # ── Step 3: stream the formatting (second) Claude call ───────
                 async with anthropic_client.messages.stream(
@@ -450,14 +467,7 @@ async def generate_response(
                         *context,
                         {"role": "user", "content": message},
                         {"role": "assistant", "content": first_response.content},
-                        {
-                            "role": "user",
-                            "content": [{
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.id,
-                                "content": json.dumps(tool_result),
-                            }],
-                        },
+                        {"role": "user", "content": all_tool_results},
                     ],
                     tools=MCP_TOOLS,
                 ) as stream:
