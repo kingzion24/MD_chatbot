@@ -144,20 +144,29 @@ def detect_language(text: str) -> Literal["sw", "en"]:
         'habari', 'mambo', 'hujambo', 'shikamoo', 'vipi', 'poa',
 
         # Common verbs
-        'nionyeshe', 'nina', 'niko', 'nataka', 'ninahitaji',
+        'nionyeshe', 'onyesha', 'linganisha', 'angalia', 'toa',
+        'nina', 'niko', 'nataka', 'ninahitaji',
         'tafadhali', 'nitumie', 'nipatie', 'naweza', 'unaweza',
 
         # Business terms
         'mauzo', 'bidhaa', 'bei', 'gharama', 'faida',
         'hifadhi', 'duka', 'mteja', 'wateja',
+        'mapato', 'matumizi', 'hesabu', 'taarifa', 'rekodi',
+        'orodha', 'stoki', 'akiba',
 
-        # Time expressions
-        'leo', 'jana', 'kesho', 'wiki', 'mwezi', 'mwaka',
+        # Time expressions — singular and plural forms
+        'leo', 'jana', 'kesho', 'wiki', 'mwezi', 'miezi',
+        'mwaka', 'miaka', 'siku', 'kila', 'kwanza', 'mwisho',
+
+        # Numbers (uniquely Kiswahili, safe to use as indicators)
+        'moja', 'mbili', 'tatu', 'nne', 'tano',
+        'saba', 'nane', 'tisa', 'kumi', 'ishirini',
+        'mitatu', 'miwili', 'minne', 'mitano',
 
         # Question words
         'je', 'nini', 'ngapi', 'vipi', 'lini', 'wapi', 'nani',
 
-        # Common words
+        # Common connectors / particles
         'ya', 'za', 'wa', 'na', 'kwa', 'au', 'ni',
         'jumla', 'kiasi', 'pesa', 'shilingi',
 
@@ -165,7 +174,7 @@ def detect_language(text: str) -> Literal["sw", "en"]:
         'yangu', 'yako', 'yake', 'zako', 'zangu',
 
         # Other common
-        'inaendeleaje', 'namna', 'siku', 'kila'
+        'inaendeleaje', 'namna', 'zaidi', 'kidogo',
     ]
 
     text_lower = text.lower()
@@ -256,13 +265,31 @@ async def log_interaction(
         logger.warning(f"Background logging failed: {e}")
 
 
-def classify_query_intent(message: str, language: str) -> tuple[bool, str]:
+def classify_query_intent(
+    message: str,
+    language: str,
+    context: List[Dict] = [],
+) -> tuple[bool, str]:
     """Route a message to either the data or conversational pipeline.
+
+    Includes a context-aware override: if the previous assistant turn asked a
+    clarifying question (contains '?') and the current reply is short, inherit
+    the data_query classification so follow-up answers aren't misrouted.
 
     Returns:
         (is_data_query, query_type)
     """
     is_data_query = query_router.is_data_query(message, language)
+
+    if not is_data_query and context:
+        last_assistant_content = next(
+            (m["content"] for m in reversed(context) if m["role"] == "assistant"),
+            None,
+        )
+        if last_assistant_content and "?" in last_assistant_content and len(message.strip()) < 60:
+            is_data_query = True
+            logger.info("📊 Context override: short reply to assistant question → DATA QUERY")
+
     query_type = "data_query" if is_data_query else "conversational"
     if is_data_query:
         logger.info("📊 Classified as DATA QUERY - will use database if needed")
@@ -431,7 +458,7 @@ async def generate_response(
     try:
         logger.info(f"💬 Processing message: {message[:50]}...")
 
-        is_data_query, query_type = classify_query_intent(message, language)
+        is_data_query, query_type = classify_query_intent(message, language, context)
 
         if is_data_query:
             # ── Step 1: non-streaming call to obtain SQL (tool use) ──────────

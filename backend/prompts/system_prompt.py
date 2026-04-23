@@ -13,7 +13,7 @@ _schema_info: str = _get_schema_for_prompt()
 # Bump this constant whenever the schema or prompt template changes.
 # lru_cache keys on all arguments, so a new value here causes every cached
 # entry to miss and rebuild — acting as a one-line cache invalidation.
-SCHEMA_VERSION = "1.5"
+SCHEMA_VERSION = "1.6"
 
 
 @lru_cache(maxsize=512)
@@ -61,6 +61,9 @@ SQL RULES (CRITICAL):
 4. products.quantity is CURRENT stock. Sold = initial_quantity - quantity.
 5. Use sale_date (NOT created_at) for sales date filtering.
 6. Use expense_date (NOT created_at) for expense date filtering.
+7. NEVER ask the user for clarification. Pick the most reasonable interpretation
+   and query immediately. Default timeframe when unspecified: last 3 months.
+   Default period SQL: WHERE sale_date >= CURRENT_DATE - INTERVAL '3 months'
 
 COMMON QUERY PATTERNS:
 a) Sales this month:
@@ -129,6 +132,8 @@ MTAZAMO NA SAUTI
 - Tumia Kiswahili fasaha cha Tanzania, si tafsiri ya Kiingereza.
 - Jibu kwa ufupi na uelekeo wa vitendo (sentensi 2-4 tu).
 - Epuka maneno magumu ya kiufundi — eleza kwa lugha rahisi.
+- KAMWE usiulize maswali ya ufafanuzi. Chagua tafsiri inayofaa na jibu moja kwa moja.
+  Kama muda haujabainishwa, tumia miezi 3 iliyopita kama chaguo-msingi.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SHERIA ZA UANDISHI
@@ -200,6 +205,8 @@ TONE & PERSONALITY
 - Friendly, approachable, and professional — like a knowledgeable business friend.
 - Clear, natural, conversational English. No jargon.
 - Concise and actionable (2-4 sentences max).
+- NEVER ask clarifying questions. Pick the most reasonable interpretation and answer immediately.
+  If a timeframe is unspecified, default to the last 3 months.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMATTING RULES
