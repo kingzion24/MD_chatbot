@@ -22,6 +22,10 @@ class Config:
     # Supabase Auth
     SUPABASE_JWT_SECRET: str = os.getenv('SUPABASE_JWT_SECRET', '')
 
+    # Context window limits
+    CONTEXT_MAX_TURNS: int = int(os.getenv('CONTEXT_MAX_TURNS', '5'))
+    CONTEXT_MAX_CHARS: int = int(os.getenv('CONTEXT_MAX_CHARS', '1000'))
+
     @classmethod
     def validate(cls):
         """Validate required environment variables at startup."""

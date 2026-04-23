@@ -327,10 +327,6 @@ async def generate_sql_with_llm(
     return response, tool_use, generated_sql
 
 
-_CONTEXT_MAX_TURNS = 10   # max round-trips kept (20 messages)
-_CONTEXT_MAX_CHARS = 8_000  # hard cap on total character volume
-
-
 def _sanitize_context(context: List[Dict]) -> List[Dict]:
     """Validate and sanitize client-supplied conversation context.
 
@@ -344,14 +340,14 @@ def _sanitize_context(context: List[Dict]) -> List[Dict]:
        (raw API objects containing tool_use / tool_result blocks) is either
        collapsed to its text portions or dropped entirely.
     4. Empty messages: stripped after sanitization.
-    5. Total character cap: if the sanitized context exceeds _CONTEXT_MAX_CHARS,
+    5. Total word cap: if the sanitized context exceeds Config.CONTEXT_MAX_WORDS,
        the oldest messages are trimmed until it fits.
     """
     ALLOWED_ROLES = {"user", "assistant"}
 
     # Step 1 — keep only the tail of the history (most recent turns).
     # Multiply by 2 because each turn = 1 user + 1 assistant message.
-    context = context[-(  _CONTEXT_MAX_TURNS * 2):]
+    context = context[-(Config.CONTEXT_MAX_TURNS * 2):]
 
     clean: List[Dict] = []
     for msg in context:
@@ -389,7 +385,7 @@ def _sanitize_context(context: List[Dict]) -> List[Dict]:
         clean.append({"role": role, "content": text})
 
     # Step 5 — total character cap: trim oldest messages first.
-    while clean and sum(len(m["content"]) for m in clean) > _CONTEXT_MAX_CHARS:
+    while clean and sum(len(m["content"]) for m in clean) > Config.CONTEXT_MAX_CHARS:
         clean.pop(0)
 
     return clean
