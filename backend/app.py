@@ -499,6 +499,13 @@ async def generate_response(
                     full_response.append(chunk)
                     yield f"data: {json.dumps({'chunk': chunk})}\n\n"
 
+            disclaimer = (
+                "Ushauri huu umetolewa na AI. Kwa maamuzi makubwa ya biashara, tafadhali wasiliana na mtaalamu."
+                if language == "sw"
+                else "This guidance is AI-generated. For major business decisions, consult a qualified professional."
+            )
+            yield f"data: {json.dumps({'type': 'disclaimer', 'text': disclaimer})}\n\n"
+
         processing_time_ms = int((time.time() - start_time) * 1000)
         logger.info(
             f"✅ Stream complete — {len(''.join(full_response))} chars "
